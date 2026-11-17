@@ -22,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
-from quantcore import arbitrage, binomial, probability, scenarios
+from quantcore import arbitrage, binomial, probability, replicate, scenarios
 from quantcore import chain as option_chain
 from quantcore.grid import price_axis
 
@@ -509,4 +509,69 @@ def options_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
         ],
         solver=solver,
         assumptions=list(report.assumptions),
+    )
+
+
+# --- payoff replication ------------------------------------------------------------
+
+
+class ReplicateRequest(BaseModel):
+    spot: float = Field(gt=0, le=1_000_000)
+    days: float = Field(gt=0, le=1825)
+    rate: float = Field(default=0.0, ge=-0.05, le=0.5)
+    div_yield: float = Field(default=0.0, ge=0.0, le=0.5)
+    atm_vol: float = Field(ge=0.01, le=5.0)
+    skew: float = Field(default=0.0, ge=-5.0, le=5.0)
+    curvature: float = Field(default=0.0, ge=-100.0, le=100.0)
+    target_prices: list[float] = Field(min_length=2, max_length=200, description="Where the drawn payoff is given.")
+    target_payoffs: list[float] = Field(min_length=2, max_length=200, description="Payoff per share at expiry at each price.")
+    mode: Literal["match", "cheapest"] = "match"
+    max_legs: int | None = Field(default=8, ge=1, le=8, description="Most option and stock positions to use. Cash is free.")
+
+    @model_validator(mode="after")
+    def same_length(self):
+        if len(self.target_prices) != len(self.target_payoffs):
+            raise ValueError("target_prices and target_payoffs must be the same length")
+        if any(abs(y) > 10 * self.spot for y in self.target_payoffs):
+            raise ValueError("payoffs must stay within ten times the price")
+        return self
+
+
+class HoldingOut(BaseModel):
+    kind: Literal["call", "put", "stock", "cash"]
+    quantity: float = Field(description="Per share. Stock: shares at expiry. Cash: amount received at expiry.")
+    strike: float | None
+    price: float = Field(description="Cost today per unit.")
+
+
+class ReplicateResponse(BaseModel):
+    holdings: list[HoldingOut]
+    cost: float = Field(description="Today, per share. Negative means the portfolio pays you.")
+    max_error: float = Field(description="Largest gap from the drawing, per share.")
+    prices: list[float]
+    target: list[float]
+    fitted: list[float]
+
+
+@app.post("/options/replicate", response_model=ReplicateResponse)
+def options_replicate(request: ReplicateRequest) -> ReplicateResponse:
+    """The portfolio of listed options, stock and cash closest to (or never below) a drawn payoff."""
+    try:
+        result = replicate.replicate(
+            request.target_prices, request.target_payoffs, request.spot, request.days, request.atm_vol, request.skew,
+            request.curvature, request.rate, request.div_yield, request.mode, max_legs=request.max_legs,
+        )
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ReplicateResponse(
+        holdings=[
+            HoldingOut(kind=h.kind, quantity=round(h.quantity, 4), strike=h.strike, price=round(h.price, 4))
+            for h in result.holdings
+            if abs(h.quantity) >= 5e-5
+        ],
+        cost=round(result.cost, 4),
+        max_error=round(result.max_error, 4),
+        prices=np.round(result.prices, 4).tolist(),
+        target=np.round(result.target, 4).tolist(),
+        fitted=np.round(result.fitted, 4).tolist(),
     )

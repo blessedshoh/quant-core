@@ -241,3 +241,34 @@ def test_arbitrage_route_refuses_a_bid_above_the_ask():
 @pytest.mark.parametrize("bad", [{"steps": 40}, {"days": 0}, {"kind": "straddle"}])
 def test_tree_refuses_bad_requests(bad):
     assert client.post("/options/tree", json={**ONE_OPTION, **bad}).status_code == 422
+
+
+# --- payoff replication -------------------------------------------------------------
+
+SKETCH = {"spot": 166, "days": 30, "rate": 0.04, "atm_vol": 0.45}
+
+
+def test_replicate_builds_a_drawn_call_spread_exactly():
+    body = client.post(
+        "/options/replicate", json={**SKETCH, "target_prices": [130, 160, 175, 200], "target_payoffs": [0, 0, 15, 15]}
+    ).json()
+    assert body["max_error"] < 1e-3
+    assert len([h for h in body["holdings"] if h["kind"] != "cash"]) <= 3
+    assert len(body["prices"]) == len(body["target"]) == len(body["fitted"])
+
+
+def test_replicate_respects_the_leg_limit():
+    xs = [124 + i * 2 for i in range(43)]
+    ys = [8 * 2.718281828 ** (-(((x - 166) / 8) ** 2)) for x in xs]
+    body = client.post("/options/replicate", json={**SKETCH, "target_prices": xs, "target_payoffs": ys, "max_legs": 3}).json()
+    assert len([h for h in body["holdings"] if h["kind"] != "cash"]) <= 3
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"target_prices": [150], "target_payoffs": [1]}, {"target_prices": [140, 190], "target_payoffs": [1]}, {"mode": "exact"},
+     {"max_legs": 20}, {"target_prices": [140, 190], "target_payoffs": [0, 99999]}],
+)
+def test_replicate_refuses_bad_requests(bad):
+    body = {**SKETCH, "target_prices": [140, 190], "target_payoffs": [0, 10], **bad}
+    assert client.post("/options/replicate", json=body).status_code == 422
