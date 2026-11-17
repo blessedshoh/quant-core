@@ -22,7 +22,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
-from quantcore import binomial, probability, scenarios
+from quantcore import arbitrage, binomial, probability, scenarios
+from quantcore import chain as option_chain
 from quantcore.grid import price_axis
 
 MAX_LEGS = 8
@@ -383,4 +384,129 @@ def options_convergence(request: ConvergenceRequest) -> ConvergenceResponse:
         leisen_reimer=[round(x, 6) for x in series["leisen_reimer"]],
         black_scholes=round(series["black_scholes"], 6),
         reference=round(reference, 6),
+    )
+
+
+# --- option chain and arbitrage --------------------------------------------------
+
+
+class ChainRequest(BaseModel):
+    spot: float = Field(gt=0, le=1_000_000)
+    days: float = Field(gt=0, le=1825)
+    rate: float = Field(default=0.0, ge=-0.05, le=0.5)
+    div_yield: float = Field(default=0.0, ge=0.0, le=0.5)
+    atm_vol: float = Field(ge=0.01, le=5.0)
+    skew: float = Field(default=0.0, ge=-5.0, le=5.0)
+    curvature: float = Field(default=0.0, ge=-100.0, le=100.0)
+    width: float = Field(default=0.25, ge=0.05, le=0.6, description="Strikes from spot * (1 - width) to spot * (1 + width).")
+
+
+class ChainRow(BaseModel):
+    strike: float
+    vol: float
+    call: float
+    put: float
+    call_delta: float
+    put_delta: float
+
+
+class ChainResponse(BaseModel):
+    forward: float
+    rows: list[ChainRow]
+
+
+@app.post("/options/chain", response_model=ChainResponse)
+def options_chain(request: ChainRequest) -> ChainResponse:
+    """Model prices for every listed strike, each at its own volatility on the smile."""
+    try:
+        strikes = option_chain.default_strikes(request.spot, request.width)
+        chain = option_chain.model_chain(
+            request.spot, request.days, request.atm_vol, request.skew, request.curvature, request.rate, request.div_yield, strikes
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    rows = [
+        ChainRow(strike=float(k), vol=round(float(v), 6), call=round(float(c), 4), put=round(float(p), 4),
+                 call_delta=round(float(cd), 4), put_delta=round(float(pd), 4))
+        for k, v, c, p, cd, pd in zip(chain.strikes, chain.vols, chain.calls, chain.puts, chain.call_deltas, chain.put_deltas)
+    ]
+    return ChainResponse(forward=round(chain.forward, 4), rows=rows)
+
+
+class QuoteIn(BaseModel):
+    strike: float = Field(gt=0, le=1_000_000)
+    call_bid: float | None = Field(default=None, ge=0, le=1_000_000)
+    call_ask: float | None = Field(default=None, ge=0, le=1_000_000)
+    put_bid: float | None = Field(default=None, ge=0, le=1_000_000)
+    put_ask: float | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class ArbitrageRequest(BaseModel):
+    spot: float = Field(gt=0, le=1_000_000)
+    days: float = Field(gt=0, le=1825)
+    rate: float = Field(default=0.0, ge=-0.05, le=0.5)
+    div_yield: float = Field(default=0.0, ge=0.0, le=0.5)
+    american: bool = False
+    quotes: list[QuoteIn] = Field(min_length=1, max_length=80)
+
+
+class TradeLegOut(BaseModel):
+    kind: Literal["call", "put", "stock", "cash"]
+    quantity: float = Field(description="Per share. Positive is bought; for cash, money lent today.")
+    strike: float | None
+    price: float
+
+
+class ViolationOut(BaseModel):
+    rule: str
+    title: str
+    detail: str
+    profit: float = Field(description="Locked in per share, in today's money.")
+    strikes: list[float]
+    trade: list[TradeLegOut]
+
+
+class SolverOut(BaseModel):
+    arbitrage: bool
+    credit: float
+    trade: list[TradeLegOut]
+    worst_payoff: float
+
+
+class ArbitrageResponse(BaseModel):
+    violations: list[ViolationOut]
+    solver: SolverOut | None = Field(description="null for American options, where the expiry-only solver does not apply.")
+    assumptions: list[str]
+
+
+def _legs(trade) -> list[TradeLegOut]:
+    return [
+        TradeLegOut(kind=leg.kind, quantity=round(float(leg.quantity), 4), strike=leg.strike, price=round(float(leg.price), 4))
+        for leg in trade
+    ]
+
+
+@app.post("/options/arbitrage", response_model=ArbitrageResponse)
+def options_arbitrage(request: ArbitrageRequest) -> ArbitrageResponse:
+    """Rule-by-rule checks and, for European options, the solver's search for a free lunch."""
+    try:
+        quotes = [arbitrage.Quote(**q.model_dump()) for q in request.quotes]
+        report = arbitrage.check(request.spot, request.days, quotes, request.rate, request.div_yield, request.american)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    solver = None
+    if report.solver is not None:
+        solver = SolverOut(
+            arbitrage=report.solver.arbitrage,
+            credit=round(report.solver.credit, 4),
+            trade=_legs(report.solver.trade),
+            worst_payoff=round(report.solver.worst_payoff, 6),
+        )
+    return ArbitrageResponse(
+        violations=[
+            ViolationOut(rule=v.rule, title=v.title, detail=v.detail, profit=round(v.profit, 4), strikes=list(v.strikes), trade=_legs(v.trade))
+            for v in report.violations
+        ],
+        solver=solver,
+        assumptions=list(report.assumptions),
     )

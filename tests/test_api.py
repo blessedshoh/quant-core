@@ -203,6 +203,41 @@ def test_convergence_route():
     assert body["reference"] == pytest.approx(body["black_scholes"], abs=1e-4)
 
 
+def test_chain_route_prices_every_strike_on_the_smile():
+    body = client.post("/options/chain", json={"spot": 166, "days": 30, "rate": 0.04, "atm_vol": 0.45, "skew": -0.3}).json()
+    strikes = [row["strike"] for row in body["rows"]]
+    assert strikes[0] == 125 and strikes[-1] == 205
+    vols = [row["vol"] for row in body["rows"]]
+    assert vols == sorted(vols, reverse=True)  # negative skew
+
+
+def test_arbitrage_route_finds_a_broken_butterfly_and_the_solver_trade():
+    chain = client.post("/options/chain", json={"spot": 166, "days": 30, "atm_vol": 0.45, "curvature": -25}).json()["rows"]
+    quotes = [
+        {"strike": r["strike"], "call_bid": r["call"] * 0.99, "call_ask": r["call"] * 1.01 + 0.01,
+         "put_bid": r["put"] * 0.99, "put_ask": r["put"] * 1.01 + 0.01}
+        for r in chain
+    ]
+    body = client.post("/options/arbitrage", json={"spot": 166, "days": 30, "quotes": quotes}).json()
+    assert any(v["rule"] == "butterfly" for v in body["violations"])
+    assert body["solver"]["arbitrage"] and body["solver"]["credit"] > 0
+    assert body["assumptions"]
+
+
+def test_arbitrage_route_is_quiet_on_clean_prices_and_skips_the_solver_for_american():
+    chain = client.post("/options/chain", json={"spot": 166, "days": 30, "atm_vol": 0.45}).json()["rows"]
+    quotes = [{"strike": r["strike"], "call_bid": r["call"], "call_ask": r["call"] + 0.02} for r in chain]
+    clean = client.post("/options/arbitrage", json={"spot": 166, "days": 30, "quotes": quotes}).json()
+    assert clean["violations"] == [] and clean["solver"]["arbitrage"] is False
+    american = client.post("/options/arbitrage", json={"spot": 166, "days": 30, "american": True, "quotes": quotes}).json()
+    assert american["solver"] is None
+
+
+def test_arbitrage_route_refuses_a_bid_above_the_ask():
+    bad = {"spot": 166, "days": 30, "quotes": [{"strike": 160, "call_bid": 9, "call_ask": 8}]}
+    assert client.post("/options/arbitrage", json=bad).status_code == 422
+
+
 @pytest.mark.parametrize("bad", [{"steps": 40}, {"days": 0}, {"kind": "straddle"}])
 def test_tree_refuses_bad_requests(bad):
     assert client.post("/options/tree", json={**ONE_OPTION, **bad}).status_code == 422
