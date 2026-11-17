@@ -59,3 +59,28 @@ def test_price_and_greeks_agree_with_quantlib(spot, strike, days, vol, rate, div
     assert float(bs.vega(*market)) == pytest.approx(reference.vega(), **tolerance)
     assert float(bs.theta(*market, kind)) == pytest.approx(reference.theta(), **tolerance)
     assert float(bs.rho(*market, kind)) == pytest.approx(reference.rho(), **tolerance)
+
+
+# --- American options: our Leisen-Reimer tree against QuantLib's -----------------
+
+AMERICAN_CASES = list(
+    itertools.product((80.0, 100.0, 125.0), (90.0, 110.0), (30, 365), (0.2, 0.5), (0.0, 0.05), (0.0, 0.03), ("call", "put"))
+)
+
+
+@pytest.mark.parametrize("spot, strike, days, vol, rate, div_yield, kind", AMERICAN_CASES)
+def test_american_tree_agrees_with_quantlib(spot, strike, days, vol, rate, div_yield, kind):
+    from quantcore import binomial
+
+    ql.Settings.instance().evaluationDate = TODAY
+    payoff = ql.PlainVanillaPayoff(ql.Option.Call if kind == "call" else ql.Option.Put, strike)
+    option = ql.VanillaOption(payoff, ql.AmericanExercise(TODAY, TODAY + int(days)))
+    process = ql.BlackScholesMertonProcess(
+        ql.QuoteHandle(ql.SimpleQuote(spot)),
+        ql.YieldTermStructureHandle(ql.FlatForward(TODAY, div_yield, DAY_COUNT)),
+        ql.YieldTermStructureHandle(ql.FlatForward(TODAY, rate, DAY_COUNT)),
+        ql.BlackVolTermStructureHandle(ql.BlackConstantVol(TODAY, ql.NullCalendar(), vol, DAY_COUNT)),
+    )
+    option.setPricingEngine(ql.BinomialVanillaEngine(process, "lr", 101))
+    ours = binomial.price(spot, strike, days / 365.0, vol, rate, div_yield, kind, american=True, steps=101)
+    assert ours == pytest.approx(option.NPV(), abs=1e-8)

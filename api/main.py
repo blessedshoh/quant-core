@@ -22,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
-from quantcore import probability, scenarios
+from quantcore import binomial, probability, scenarios
 from quantcore.grid import price_axis
 
 MAX_LEGS = 8
@@ -66,6 +66,9 @@ class GridRequest(BaseModel):
     div_yield: float = Field(default=0.0, ge=0.0, le=0.5)
     legs: list[LegIn] = Field(min_length=1, max_length=MAX_LEGS)
     range_pct: float = Field(default=0.25, ge=0.02, le=0.9, description="Half-width of the price axis around spot.")
+    exercise: Literal["european", "american"] = Field(
+        default="european", description="american values every option with a binomial tree that allows early exercise."
+    )
 
 
 # --- what it gets back --------------------------------------------------------
@@ -151,6 +154,7 @@ def _position(request: GridRequest) -> qc.Position:
         rate=request.rate,
         div_yield=request.div_yield,
         legs=[qc.Leg(**leg.model_dump()) for leg in request.legs],
+        exercise=request.exercise,
     )
 
 
@@ -295,4 +299,88 @@ def options_explain(request: ExplainRequest) -> ExplainResponse:
     return ExplainResponse(
         price_move=round(move, 4),
         **{name: round(getattr(parts, name), 2) for name in ("delta", "gamma", "theta", "vega", "unexplained", "actual")},
+    )
+
+
+# --- binomial explorer ----------------------------------------------------------
+
+
+class SingleOption(BaseModel):
+    spot: float = Field(gt=0, le=1_000_000)
+    strike: float = Field(gt=0, le=1_000_000)
+    days: float = Field(gt=0, le=1825)
+    vol: float = Field(ge=0.01, le=5.0)
+    rate: float = Field(default=0.0, ge=-0.05, le=0.5)
+    div_yield: float = Field(default=0.0, ge=0.0, le=0.5)
+    kind: Literal["call", "put"] = "put"
+    american: bool = True
+
+
+class TreeRequest(SingleOption):
+    steps: int = Field(default=5, ge=1, le=12)
+
+
+class TreeResponse(BaseModel):
+    prices: list[list[float]] = Field(description="Row i holds the i + 1 nodes after i steps, lowest price first.")
+    values: list[list[float]]
+    exercise: list[list[bool]]
+    p: float
+    u: float
+    d: float
+    dt_days: float
+    european_value: float = Field(description="Black-Scholes value, for comparison with the tree's root.")
+    american_value: float = Field(description="Accurate (201-step Leisen-Reimer) American value.")
+
+
+@app.post("/options/tree", response_model=TreeResponse)
+def options_tree(request: TreeRequest) -> TreeResponse:
+    """Every node of a small Cox-Ross-Rubinstein tree, for drawing."""
+    years = request.days / 365.0
+    market = (request.spot, request.strike, years, request.vol, request.rate, request.div_yield)
+    try:
+        tree = binomial.build_tree(*market, request.kind, request.american, request.steps)
+        accurate = binomial.price(*market, request.kind, True, 201)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return TreeResponse(
+        prices=[[round(x, 4) for x in row] for row in tree.prices],
+        values=[[round(x, 4) for x in row] for row in tree.values],
+        exercise=tree.exercise,
+        p=round(tree.p, 6),
+        u=round(tree.u, 6),
+        d=round(tree.d, 6),
+        dt_days=round(tree.dt * 365.0, 6),
+        european_value=round(float(qc.black_scholes.price(*market, request.kind)), 4),
+        american_value=round(accurate, 4),
+    )
+
+
+class ConvergenceRequest(SingleOption):
+    max_steps: int = Field(default=100, ge=5, le=200)
+
+
+class ConvergenceResponse(BaseModel):
+    steps: list[int]
+    crr: list[float]
+    leisen_reimer: list[float]
+    black_scholes: float = Field(description="European Black-Scholes value.")
+    reference: float = Field(description="Leisen-Reimer value with 1,001 steps: the target the trees approach.")
+
+
+@app.post("/options/convergence", response_model=ConvergenceResponse)
+def options_convergence(request: ConvergenceRequest) -> ConvergenceResponse:
+    """Tree prices for 1 to max_steps steps, both methods, to show how they approach the answer."""
+    years = request.days / 365.0
+    market = (request.spot, request.strike, years, request.vol, request.rate, request.div_yield)
+    try:
+        series = binomial.convergence(*market, request.kind, request.american, range(1, request.max_steps + 1))
+        reference = binomial.price(*market, request.kind, request.american, 1001)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ConvergenceResponse(
+        steps=series["steps"],
+        crr=[round(x, 6) for x in series["crr"]],
+        leisen_reimer=[round(x, 6) for x in series["leisen_reimer"]],
+        black_scholes=round(series["black_scholes"], 6),
+        reference=round(reference, 6),
     )

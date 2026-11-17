@@ -174,3 +174,35 @@ def test_explain_matches_the_engine_and_adds_up():
 @pytest.mark.parametrize("bad", [{"price_move_pct": -1}, {"vol_shift": 2}, {"days_passed": -3}])
 def test_explain_refuses_bad_requests(bad):
     assert client.post("/options/explain", json={**LONG_CALL, **bad}).status_code == 422
+
+
+# --- American exercise and the binomial explorer ---------------------------------
+
+PUT = {"spot": 166.0, "rate": 0.04, "legs": [{"kind": "put", "quantity": 1, "strike": 200, "days": 90, "vol": 0.5}]}
+ONE_OPTION = {"spot": 100, "strike": 105, "days": 182.5, "vol": 0.3, "rate": 0.05}
+
+
+def test_american_exercise_raises_the_value_of_a_deep_put():
+    european = client.post("/options/grid", json=PUT).json()["summary"]["entry_cost"]
+    american = client.post("/options/grid", json={**PUT, "exercise": "american"}).json()
+    assert american["summary"]["entry_cost"] > european
+    assert american["profit"]["shape"][0] == 9  # the coarser American grid
+
+
+def test_tree_route():
+    body = client.post("/options/tree", json={**ONE_OPTION, "kind": "put", "steps": 4}).json()
+    assert len(body["prices"]) == 5 and len(body["prices"][4]) == 5
+    assert body["american_value"] > body["european_value"]
+    assert body["exercise"][4][0] is True  # the lowest price at expiry: the put pays
+
+
+def test_convergence_route():
+    body = client.post("/options/convergence", json={**ONE_OPTION, "kind": "call", "american": False, "max_steps": 40}).json()
+    assert body["steps"] == list(range(1, 41))
+    assert abs(body["leisen_reimer"][-1] - body["black_scholes"]) < 0.001
+    assert body["reference"] == pytest.approx(body["black_scholes"], abs=1e-4)
+
+
+@pytest.mark.parametrize("bad", [{"steps": 40}, {"days": 0}, {"kind": "straddle"}])
+def test_tree_refuses_bad_requests(bad):
+    assert client.post("/options/tree", json={**ONE_OPTION, **bad}).status_code == 422

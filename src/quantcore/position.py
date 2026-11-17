@@ -22,11 +22,13 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import brentq
 
+from . import binomial
 from . import black_scholes as bs
 
 OPTION_KINDS = ("call", "put")
 MIN_VOL = 1e-4  # a shocked volatility never goes below this
 LEG_KINDS = OPTION_KINDS + ("stock",)
+EXERCISE_STYLES = ("european", "american")
 
 
 @dataclass(frozen=True)
@@ -79,12 +81,21 @@ class Leg:
 
 @dataclass(frozen=True)
 class Position:
-    """A spot price, the legs held against it, and the market assumptions."""
+    """A spot price, the legs held against it, and the market assumptions.
+
+    exercise     "european": every option is valued with Black-Scholes.
+                 "american": every option is valued with a Leisen-Reimer binomial
+                 tree that allows early exercise.
+    tree_steps   steps in that tree. The default gives prices accurate to well
+                 under a cent per share; the profit grid uses fewer for speed.
+    """
 
     spot: float
     legs: tuple[Leg, ...]
     rate: float = 0.0
     div_yield: float = 0.0
+    exercise: str = "european"
+    tree_steps: int = 201
 
     def __post_init__(self):
         object.__setattr__(self, "legs", tuple(self.legs))
@@ -92,6 +103,14 @@ class Position:
             raise ValueError("spot must be positive")
         if not self.legs:
             raise ValueError("a position needs at least one leg")
+        if self.exercise not in EXERCISE_STYLES:
+            raise ValueError(f"exercise must be one of {EXERCISE_STYLES}")
+        if self.tree_steps < 1:
+            raise ValueError("tree_steps must be at least 1")
+
+    @property
+    def american(self) -> bool:
+        return self.exercise == "american"
 
     @property
     def strikes(self) -> list[float]:
@@ -122,6 +141,10 @@ def leg_price(leg: Leg, position: Position, prices, days_forward=0.0, vol_scale=
         return prices.copy()
     remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
     vol = np.maximum(leg.vol * vol_scale + vol_shift, MIN_VOL)
+    if position.american:
+        return binomial.price_many(
+            prices, leg.strike, remaining_years, vol, position.rate, position.div_yield, leg.kind, True, position.tree_steps
+        )
     return bs.price(prices, leg.strike, remaining_years, vol, position.rate, position.div_yield, leg.kind)
 
 
@@ -225,6 +248,12 @@ def net_greeks(position: Position, prices=None, days_forward=0.0, vol_scale=1.0)
         if not leg.is_option:
             total["delta"] += leg.size
             continue
+        if position.american:
+            # A tree has no closed-form Greeks, so bump and reprice: the same check
+            # the tests use to verify the Black-Scholes formulas.
+            for name, value in _bumped_greeks(leg, position, prices, days_forward, vol_scale).items():
+                total[name] += leg.size * value
+            continue
         remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
         market = (prices, leg.strike, remaining_years, leg.vol * vol_scale, position.rate, position.div_yield)
         total["delta"] += leg.size * bs.delta(*market, leg.kind)
@@ -232,3 +261,23 @@ def net_greeks(position: Position, prices=None, days_forward=0.0, vol_scale=1.0)
         total["theta_per_day"] += leg.size * bs.theta(*market, leg.kind) / bs.DAYS_PER_YEAR
         total["vega_per_point"] += leg.size * bs.vega(*market) / 100.0
     return total
+
+
+def _bumped_greeks(leg: Leg, position: Position, prices, days_forward, vol_scale) -> dict[str, np.ndarray]:
+    """Greeks of one leg (per share) by repricing it with each input nudged."""
+    def at(s=prices, day=days_forward, shift=0.0):
+        return np.asarray(leg_price(leg, position, s, day, vol_scale, shift), dtype=float)
+
+    h = 0.01 * prices  # 1% of the price: wide enough to step over the tree's small kinks
+    up, mid, down = at(s=prices + h), at(), at(s=prices - h)
+    remaining = np.maximum(leg.days - days_forward, 0.0)
+    step = np.minimum(0.25, remaining)  # a quarter of a day, never past expiry
+    later = at(day=days_forward + step)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        theta = np.where(step > 0, (later - mid) / step, 0.0)
+    return {
+        "delta": (up - down) / (2 * h),
+        "gamma": (up - 2 * mid + down) / (h * h),
+        "theta_per_day": theta,
+        "vega_per_point": at(shift=0.005) - at(shift=-0.005),
+    }

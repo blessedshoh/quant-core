@@ -17,11 +17,15 @@ profit has shape (len(vol_scales), len(days), len(prices)).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .position import Position, first_expiry, net_greeks, profit
+from .position import Position, entry_cost, first_expiry, net_greeks, profit, value
+
+AMERICAN_DAYS = 17
+AMERICAN_VOLS = 4
+AMERICAN_GRID_STEPS = 31
 
 
 def price_axis(position: Position, range_pct: float = 0.25, points: int = 81) -> np.ndarray:
@@ -118,9 +122,17 @@ def profit_grid(
 ) -> Grid:
     """Price the position at every (volatility, day, price) combination in one vectorised call."""
     prices = price_axis(position, range_pct) if prices is None else np.asarray(prices, dtype=float)
+    cost = entry_cost(position)  # from the accurate tree, even when the grid uses a faster one
+    if position.american:
+        # Trees are far slower than the Black-Scholes formula, so American grids use
+        # fewer dates, fewer volatility levels and a 31-step tree: about 0.3 s per leg,
+        # with prices within about 2 cents per share of a 1,601-step tree.
+        days = day_axis(position, AMERICAN_DAYS) if days is None else np.asarray(days, dtype=float)
+        vol_scales = vol_axis(points_each_side=AMERICAN_VOLS) if vol_scales is None else np.asarray(vol_scales, dtype=float)
+        position = replace(position, tree_steps=AMERICAN_GRID_STEPS)
     days = day_axis(position) if days is None else np.asarray(days, dtype=float)
     vol_scales = vol_axis() if vol_scales is None else np.asarray(vol_scales, dtype=float)
-    cube = profit(position, prices[None, None, :], days[None, :, None], vol_scales[:, None, None])
+    cube = value(position, prices[None, None, :], days[None, :, None], vol_scales[:, None, None]) - cost
     return Grid(prices=prices, days=days, vol_scales=vol_scales, profit=np.asarray(cube, dtype=float))
 
 
