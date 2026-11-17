@@ -264,3 +264,35 @@ def options_risk(request: RiskRequest) -> RiskResponse:
             profit=np.round(table.profit, 2).tolist(),
         ),
     )
+
+
+class ExplainRequest(GridRequest):
+    price_move_pct: float = Field(default=0.05, gt=-0.9, le=2.0, description="Price move as a fraction of today's price.")
+    days_passed: float = Field(default=0.0, ge=0, le=1825)
+    vol_shift: float = Field(default=0.0, ge=-1.0, le=1.0, description="Volatility change: 0.05 is +5 points.")
+
+
+class ExplainResponse(BaseModel):
+    """A change in value split into what each Greek predicts, plus what is left over."""
+
+    price_move: float
+    delta: float
+    gamma: float
+    theta: float
+    vega: float
+    unexplained: float
+    actual: float
+
+
+@app.post("/options/explain", response_model=ExplainResponse)
+def options_explain(request: ExplainRequest) -> ExplainResponse:
+    try:
+        position = _position(request)
+        move = position.spot * request.price_move_pct
+        parts = scenarios.explain(position, move, request.days_passed, request.vol_shift)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ExplainResponse(
+        price_move=round(move, 4),
+        **{name: round(getattr(parts, name), 2) for name in ("delta", "gamma", "theta", "vega", "unexplained", "actual")},
+    )

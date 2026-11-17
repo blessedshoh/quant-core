@@ -152,3 +152,25 @@ def test_risk_for_stock_only_has_no_option_numbers():
 @pytest.mark.parametrize("bad", [{"drift": 3}, {"horizon_days": -1}, {"legs": []}])
 def test_risk_refuses_bad_requests(bad):
     assert client.post("/options/risk", json={**LONG_CALL, **bad}).status_code == 422
+
+
+# --- explain ------------------------------------------------------------------
+
+
+def test_explain_matches_the_engine_and_adds_up():
+    from quantcore import scenarios
+
+    body = client.post(
+        "/options/explain", json={**LONG_CALL, "price_move_pct": 0.1, "days_passed": 7, "vol_shift": -0.05}
+    ).json()
+    engine = scenarios.explain(ENGINE_LONG_CALL, 16.6, 7, -0.05)
+    assert body["price_move"] == pytest.approx(16.6)
+    for name in ("delta", "gamma", "theta", "vega", "unexplained", "actual"):
+        assert body[name] == pytest.approx(getattr(engine, name), abs=0.006)
+    total = body["delta"] + body["gamma"] + body["theta"] + body["vega"] + body["unexplained"]
+    assert total == pytest.approx(body["actual"], abs=0.03)
+
+
+@pytest.mark.parametrize("bad", [{"price_move_pct": -1}, {"vol_shift": 2}, {"days_passed": -3}])
+def test_explain_refuses_bad_requests(bad):
+    assert client.post("/options/explain", json={**LONG_CALL, **bad}).status_code == 422
