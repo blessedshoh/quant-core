@@ -22,6 +22,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
+from quantcore import probability, scenarios
+from quantcore.grid import price_axis
 
 MAX_LEGS = 8
 
@@ -109,6 +111,49 @@ class GridResponse(BaseModel):
     summary: Summary
 
 
+class RiskRequest(GridRequest):
+    drift: float | None = Field(
+        default=None, ge=-1.0, le=1.0, description="Your expected annual return, for a real-world view. Leave empty for risk-neutral."
+    )
+    horizon_days: float = Field(default=0.0, ge=0, le=1825, description="When the scenario shocks happen, in days from today.")
+
+
+class Distribution(BaseModel):
+    """Risk-neutral density of the price on the first expiry, on the same price axis as the grid."""
+
+    days: float
+    vol: float
+    prices: list[float]
+    density: list[float]
+    below_range: float = Field(description="Probability of finishing below the first price.")
+    above_range: float = Field(description="Probability of finishing above the last price.")
+
+
+class ScenarioTable(BaseModel):
+    price_shocks: list[float] = Field(description="Fractions of today's price: -0.1 is a 10% drop.")
+    vol_shifts: list[float] = Field(description="Volatility changes: 0.1 is +10 points.")
+    horizon_days: float
+    profit: list[list[float]] = Field(description="Indexed [vol_shift][price_shock].")
+
+
+class RiskResponse(BaseModel):
+    representative_vol: float | None
+    chance_of_profit: float | None = Field(description="Risk-neutral, at the first expiry.")
+    chance_of_profit_with_drift: float | None
+    expected_profit: float | None = Field(description="Risk-neutral average profit at the first expiry.")
+    distribution: Distribution | None
+    scenarios: ScenarioTable
+
+
+def _position(request: GridRequest) -> qc.Position:
+    return qc.Position(
+        spot=request.spot,
+        rate=request.rate,
+        div_yield=request.div_yield,
+        legs=[qc.Leg(**leg.model_dump()) for leg in request.legs],
+    )
+
+
 # --- the app ------------------------------------------------------------------
 
 app = FastAPI(
@@ -143,12 +188,7 @@ def health() -> dict:
 def options_grid(request: GridRequest) -> GridResponse:
     """Profit at every price, date and volatility, plus the headline numbers."""
     try:
-        position = qc.Position(
-            spot=request.spot,
-            rate=request.rate,
-            div_yield=request.div_yield,
-            legs=[qc.Leg(**leg.model_dump()) for leg in request.legs],
-        )
+        position = _position(request)
         grid = qc.profit_grid(position, range_pct=request.range_pct)
         greeks = qc.greeks_grid(position, grid.days, grid.vol_scales)
         best, worst = qc.profit_range(position)
@@ -177,4 +217,50 @@ def options_grid(request: GridRequest) -> GridResponse:
             vega_per_point=_rows(greeks["vega_per_point"], 4),
         ),
         summary=summary,
+    )
+
+
+@app.post("/options/risk", response_model=RiskResponse)
+def options_risk(request: RiskRequest) -> RiskResponse:
+    """Chance of profit, the price distribution and the scenario grid for a position."""
+    try:
+        position = _position(request)
+        vol = probability.representative_vol(position)
+        days = qc.first_expiry(position)
+        distribution = None
+        if vol is not None and days:
+            prices = price_axis(position, request.range_pct)
+            edges = probability.cdf([prices[0], prices[-1]], position.spot, days, vol, position.rate, position.div_yield)
+            distribution = Distribution(
+                days=days,
+                vol=round(vol, 6),
+                prices=np.round(prices, 4).tolist(),
+                density=np.round(
+                    probability.density(prices, position.spot, days, vol, position.rate, position.div_yield), 8
+                ).tolist(),
+                below_range=round(float(edges[0]), 6),
+                above_range=round(float(1 - edges[1]), 6),
+            )
+        table = scenarios.scenario_grid(position, days_forward=request.horizon_days)
+        chance = probability.chance_of_profit(position)
+        with_drift = probability.chance_of_profit(position, drift=request.drift) if request.drift is not None else None
+        expected = probability.expected_profit(position)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    def rounded(x, digits):
+        return None if x is None else round(x, digits)
+
+    return RiskResponse(
+        representative_vol=rounded(vol, 6),
+        chance_of_profit=rounded(chance, 6),
+        chance_of_profit_with_drift=rounded(with_drift, 6),
+        expected_profit=rounded(expected, 2),
+        distribution=distribution,
+        scenarios=ScenarioTable(
+            price_shocks=table.price_shocks.tolist(),
+            vol_shifts=table.vol_shifts.tolist(),
+            horizon_days=table.days_forward,
+            profit=np.round(table.profit, 2).tolist(),
+        ),
     )

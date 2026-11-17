@@ -116,3 +116,39 @@ def test_local_development_origins_need_an_explicit_switch(monkeypatch):
     finally:
         monkeypatch.delenv("QUANTCORE_DEV_ORIGINS")
         importlib.reload(main)
+
+
+# --- risk ---------------------------------------------------------------------
+
+
+def test_risk_matches_the_engine():
+    from quantcore import probability, scenarios
+
+    body = client.post("/options/risk", json=LONG_CALL).json()
+    assert body["chance_of_profit"] == pytest.approx(probability.chance_of_profit(ENGINE_LONG_CALL), abs=1e-6)
+    assert body["expected_profit"] == pytest.approx(probability.expected_profit(ENGINE_LONG_CALL), abs=0.01)
+    assert body["chance_of_profit_with_drift"] is None
+    np.testing.assert_allclose(body["scenarios"]["profit"], scenarios.scenario_grid(ENGINE_LONG_CALL).profit, atol=0.006)
+
+    dist = body["distribution"]
+    assert dist["days"] == 30 and len(dist["prices"]) == len(dist["density"])
+    inside = np.trapezoid(dist["density"], dist["prices"])
+    assert inside + dist["below_range"] + dist["above_range"] == pytest.approx(1.0, abs=2e-3)
+
+
+def test_risk_with_a_view_and_a_horizon():
+    body = client.post("/options/risk", json={**LONG_CALL, "drift": 0.4, "horizon_days": 10}).json()
+    assert body["chance_of_profit_with_drift"] > body["chance_of_profit"]
+    assert body["scenarios"]["horizon_days"] == 10
+    assert body["scenarios"]["profit"][2][4] < 0  # ten days of decay, nothing else moved
+
+
+def test_risk_for_stock_only_has_no_option_numbers():
+    body = client.post("/options/risk", json={"spot": 50, "legs": [{"kind": "stock", "quantity": 100}]}).json()
+    assert body["chance_of_profit"] is None and body["distribution"] is None
+    assert body["scenarios"]["profit"][2][8] == pytest.approx(1000.0)  # +20% on $5,000 of stock
+
+
+@pytest.mark.parametrize("bad", [{"drift": 3}, {"horizon_days": -1}, {"legs": []}])
+def test_risk_refuses_bad_requests(bad):
+    assert client.post("/options/risk", json={**LONG_CALL, **bad}).status_code == 422

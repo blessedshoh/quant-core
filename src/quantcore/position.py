@@ -25,6 +25,7 @@ from scipy.optimize import brentq
 from . import black_scholes as bs
 
 OPTION_KINDS = ("call", "put")
+MIN_VOL = 1e-4  # a shocked volatility never goes below this
 LEG_KINDS = OPTION_KINDS + ("stock",)
 
 
@@ -103,23 +104,25 @@ def first_expiry(position: Position) -> float | None:
     return min(days) if days else None
 
 
-def leg_price(leg: Leg, position: Position, prices, days_forward=0.0, vol_scale=1.0):
+def leg_price(leg: Leg, position: Position, prices, days_forward=0.0, vol_scale=1.0, vol_shift=0.0):
     """Model price PER SHARE of one leg at the given underlying prices.
 
     days_forward   how many days from today the valuation date is
     vol_scale      multiplier applied to the leg's volatility (1.0 leaves it unchanged)
+    vol_shift      amount added to the volatility after scaling: 0.05 is +5 volatility
+                   points, the way risk desks quote volatility shocks
     """
-    prices, days_forward, vol_scale = np.broadcast_arrays(
+    prices, days_forward, vol_scale, vol_shift = np.broadcast_arrays(
         np.asarray(prices, dtype=float),
         np.asarray(days_forward, dtype=float),
         np.asarray(vol_scale, dtype=float),
+        np.asarray(vol_shift, dtype=float),
     )
     if not leg.is_option:
         return prices.copy()
     remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
-    return bs.price(
-        prices, leg.strike, remaining_years, leg.vol * vol_scale, position.rate, position.div_yield, leg.kind
-    )
+    vol = np.maximum(leg.vol * vol_scale + vol_shift, MIN_VOL)
+    return bs.price(prices, leg.strike, remaining_years, vol, position.rate, position.div_yield, leg.kind)
 
 
 def entry_price(leg: Leg, position: Position) -> float:
@@ -134,14 +137,14 @@ def entry_cost(position: Position) -> float:
     return sum(leg.size * entry_price(leg, position) for leg in position.legs)
 
 
-def value(position: Position, prices, days_forward=0.0, vol_scale=1.0):
+def value(position: Position, prices, days_forward=0.0, vol_scale=1.0, vol_shift=0.0):
     """What the whole position is worth at the given prices, date and volatility."""
-    return sum(leg.size * leg_price(leg, position, prices, days_forward, vol_scale) for leg in position.legs)
+    return sum(leg.size * leg_price(leg, position, prices, days_forward, vol_scale, vol_shift) for leg in position.legs)
 
 
-def profit(position: Position, prices, days_forward=0.0, vol_scale=1.0):
+def profit(position: Position, prices, days_forward=0.0, vol_scale=1.0, vol_shift=0.0):
     """Profit or loss against the entry cost."""
-    return value(position, prices, days_forward, vol_scale) - entry_cost(position)
+    return value(position, prices, days_forward, vol_scale, vol_shift) - entry_cost(position)
 
 
 def profit_at_expiry(position: Position, prices):
