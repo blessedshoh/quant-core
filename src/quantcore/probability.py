@@ -14,6 +14,7 @@ assumes the stock earns only the risk-free rate.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.special import ndtr
@@ -56,6 +57,18 @@ def density(prices, spot, days, vol, rate=0.0, div_yield=0.0, drift=None):
     return np.exp(-0.5 * ((np.log(x) - mean) / sd) ** 2) / (x * sd * math.sqrt(2.0 * math.pi))
 
 
+def vol_weights(position: Position) -> list[tuple[int, float, float]]:
+    """(leg index, volatility, weight) for every option leg, weight = |size| x vega today."""
+    rows = []
+    for index, leg in enumerate(position.legs):
+        if not leg.is_option:
+            continue
+        years = leg.days / bs.DAYS_PER_YEAR
+        vega = float(bs.vega(position.spot, leg.strike, years, leg.vol, position.rate, position.div_yield))
+        rows.append((index, float(leg.vol), abs(leg.size) * vega))
+    return rows
+
+
 def representative_vol(position: Position) -> float | None:
     """One volatility for the whole position, to describe where the price may go.
 
@@ -63,19 +76,43 @@ def representative_vol(position: Position) -> float | None:
     depends on it (size times vega), so the leg that matters most counts most.
     None for a position with no options.
     """
-    vols, weights = [], []
-    for leg in position.legs:
-        if not leg.is_option:
-            continue
-        years = leg.days / bs.DAYS_PER_YEAR
-        vega = float(bs.vega(position.spot, leg.strike, years, leg.vol, position.rate, position.div_yield))
-        vols.append(leg.vol)
-        weights.append(abs(leg.size) * vega)
-    if not vols:
+    rows = vol_weights(position)
+    if not rows:
         return None
+    vols = [vol for _, vol, _ in rows]
+    weights = [weight for _, _, weight in rows]
     if sum(weights) == 0:
         return float(np.mean(vols))
     return float(np.average(vols, weights=weights))
+
+
+@dataclass(frozen=True)
+class Interval:
+    """A stretch of finishing prices between two break-evens (0 and infinity at the ends)."""
+
+    low: float
+    high: float
+    profitable: bool
+    probability: float
+
+
+def outcome_intervals(position: Position, vol=None, drift=None) -> list[Interval] | None:
+    """The price axis cut at the break-even points, with the chance of finishing in each piece.
+
+    The probabilities add up to one. None for a position with no expiry
+    (stock only) or one that expires today.
+    """
+    days = first_expiry(position)
+    if not days:
+        return None
+    vol = representative_vol(position) if vol is None else vol
+    edges = [0.0] + breakevens(position) + [math.inf]
+    pieces = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        inside = high / 2 if low == 0 else (low * 2 if math.isinf(high) else (low + high) / 2)
+        mass = cdf([low, high], position.spot, days, vol, position.rate, position.div_yield, drift)
+        pieces.append(Interval(low, high, float(profit_at_expiry(position, inside)) > 0, float(mass[1] - mass[0])))
+    return pieces
 
 
 def chance_of_profit(position: Position, vol=None, drift=None) -> float | None:
@@ -90,15 +127,7 @@ def chance_of_profit(position: Position, vol=None, drift=None) -> float | None:
         return None
     if days == 0:
         return 1.0 if float(profit_at_expiry(position, position.spot)) > 0 else 0.0
-    vol = representative_vol(position) if vol is None else vol
-    edges = [0.0] + breakevens(position) + [math.inf]
-    total = 0.0
-    for low, high in zip(edges[:-1], edges[1:]):
-        inside = high / 2 if low == 0 else (low * 2 if math.isinf(high) else (low + high) / 2)
-        if float(profit_at_expiry(position, inside)) > 0:
-            mass = cdf([low, high], position.spot, days, vol, position.rate, position.div_yield, drift)
-            total += float(mass[1] - mass[0])
-    return total
+    return sum(piece.probability for piece in outcome_intervals(position, vol, drift) if piece.profitable)
 
 
 def expected_profit(position: Position, vol=None, drift=None, points: int = 8001) -> float | None:

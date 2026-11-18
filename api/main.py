@@ -22,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
-from quantcore import arbitrage, binomial, probability, replicate, scenarios
+from quantcore import arbitrage, binomial, probability, replicate, scenarios, work
 from quantcore import chain as option_chain
 from quantcore.grid import price_axis
 
@@ -300,6 +300,122 @@ def options_explain(request: ExplainRequest) -> ExplainResponse:
     return ExplainResponse(
         price_move=round(move, 4),
         **{name: round(getattr(parts, name), 2) for name in ("delta", "gamma", "theta", "vega", "unexplained", "actual")},
+    )
+
+
+# --- show your work -------------------------------------------------------------
+
+
+class LegWorkOut(BaseModel):
+    kind: str
+    quantity: float
+    size: float
+    strike: float | None
+    days: float | None
+    years: float | None
+    vol: float | None
+    d1: float | None
+    d2: float | None
+    n_d1: float | None = Field(description="N(d1) for a call, N(-d1) for a put.")
+    n_d2: float | None = Field(description="N(d2) for a call, N(-d2) for a put.")
+    spot_discount: float | None = Field(description="e^(-qT)")
+    strike_discount: float | None = Field(description="e^(-rT)")
+    european_price: float | None
+    american_price: float | None
+    entry_price: float
+    entry_price_stated: bool
+    cost: float
+    greeks: dict[str, float] = Field(description="Per share.")
+    contribution: dict[str, float] = Field(description="Size times the per-share Greek.")
+
+
+class IntervalOut(BaseModel):
+    low: float
+    high: float | None = Field(description="null means no upper limit.")
+    profitable: bool
+    probability: float
+
+
+class ChanceWorkOut(BaseModel):
+    days: float
+    vol: float
+    vol_weights: list[tuple[int, float, float]] = Field(description="(leg index, vol, weight = |size| x vega).")
+    mean_log: float
+    sd_log: float
+    intervals: list[IntervalOut]
+    chance: float
+
+
+class WorkResponse(BaseModel):
+    """The intermediate values behind the cost, Greeks and chance of profit, for today."""
+
+    exercise: str
+    legs: list[LegWorkOut]
+    entry_cost: float
+    greeks: dict[str, float]
+    chance: ChanceWorkOut | None
+
+
+def _r(x, digits):
+    if x is None:
+        return None
+    if isinstance(x, float) and math.isinf(x):
+        return None
+    return round(float(x), digits)
+
+
+@app.post("/options/work", response_model=WorkResponse)
+def options_work(request: GridRequest) -> WorkResponse:
+    """Every step behind the headline numbers, so each can be checked by hand."""
+    try:
+        work_out = work.show_work(_position(request))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    def leg_out(leg) -> LegWorkOut:
+        return LegWorkOut(
+            kind=leg.kind,
+            quantity=leg.quantity,
+            size=leg.size,
+            strike=leg.strike,
+            days=leg.days,
+            years=_r(leg.years, 6),
+            vol=leg.vol,
+            d1=_r(leg.d1, 6),
+            d2=_r(leg.d2, 6),
+            n_d1=_r(leg.n_d1, 6),
+            n_d2=_r(leg.n_d2, 6),
+            spot_discount=_r(leg.spot_discount, 6),
+            strike_discount=_r(leg.strike_discount, 6),
+            european_price=_r(leg.european_price, 4),
+            american_price=_r(leg.american_price, 4),
+            entry_price=round(leg.entry_price, 4),
+            entry_price_stated=leg.entry_price_stated,
+            cost=round(leg.cost, 2),
+            greeks={k: round(v, 6) for k, v in leg.greeks.items()},
+            contribution={k: round(v, 4) for k, v in leg.contribution.items()},
+        )
+
+    chance = work_out.chance
+    return WorkResponse(
+        exercise=work_out.exercise,
+        legs=[leg_out(leg) for leg in work_out.legs],
+        entry_cost=round(work_out.entry_cost, 2),
+        greeks={k: round(v, 4) for k, v in work_out.greeks.items()},
+        chance=None
+        if chance is None
+        else ChanceWorkOut(
+            days=chance.days,
+            vol=round(chance.vol, 6),
+            vol_weights=[(i, v, round(w, 4)) for i, v, w in chance.vol_weights],
+            mean_log=round(chance.mean_log, 6),
+            sd_log=round(chance.sd_log, 6),
+            intervals=[
+                IntervalOut(low=round(p.low, 4), high=_r(p.high, 4), profitable=p.profitable, probability=round(p.probability, 6))
+                for p in chance.intervals
+            ],
+            chance=round(chance.chance, 6),
+        ),
     )
 
 

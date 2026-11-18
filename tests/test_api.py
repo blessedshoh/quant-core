@@ -272,3 +272,23 @@ def test_replicate_respects_the_leg_limit():
 def test_replicate_refuses_bad_requests(bad):
     body = {**SKETCH, "target_prices": [140, 190], "target_payoffs": [0, 10], **bad}
     assert client.post("/options/replicate", json=body).status_code == 422
+
+
+def test_work_rebuilds_the_grid_headline_numbers():
+    spread = {**LONG_CALL, "legs": LONG_CALL["legs"] + [{"kind": "call", "quantity": -10, "strike": 200, "days": 30, "vol": 0.6}]}
+    work = client.post("/options/work", json=spread).json()
+    grid = client.post("/options/grid", json=spread).json()
+
+    assert work["entry_cost"] == pytest.approx(grid["summary"]["entry_cost"], abs=0.01)
+    assert sum(leg["cost"] for leg in work["legs"]) == pytest.approx(work["entry_cost"], abs=0.02)
+    assert work["legs"][0]["d1"] is not None and work["legs"][0]["american_price"] is None
+    chance = work["chance"]
+    assert sum(p["probability"] for p in chance["intervals"]) == pytest.approx(1.0, abs=1e-5)
+    assert chance["intervals"][-1]["high"] is None  # the last stretch has no upper limit
+    risk = client.post("/options/risk", json=spread).json()
+    assert chance["chance"] == pytest.approx(risk["chance_of_profit"], abs=1e-6)
+
+
+def test_work_refuses_a_bad_position():
+    response = client.post("/options/work", json={**LONG_CALL, "legs": [{"kind": "call", "quantity": 1}]})
+    assert response.status_code == 422
