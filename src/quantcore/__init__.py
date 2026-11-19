@@ -3,6 +3,7 @@
 from . import black_scholes
 from .grid import Grid, greeks_grid, profit_grid
 from .position import (
+    Event,
     Leg,
     Position,
     breakevens,
@@ -19,6 +20,7 @@ from .position import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "Event",
     "Grid",
     "Leg",
     "Position",

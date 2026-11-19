@@ -29,6 +29,27 @@ OPTION_KINDS = ("call", "put")
 MIN_VOL = 1e-4  # a shocked volatility never goes below this
 LEG_KINDS = OPTION_KINDS + ("stock",)
 EXERCISE_STYLES = ("european", "american")
+EVENT_DAYS = (1.0, 1825.0)  # earliest and latest earnings date, in days from today
+EVENT_MOVE = (0.005, 0.5)  # one-day standard deviation of the earnings jump in the log price
+
+
+@dataclass(frozen=True)
+class Event:
+    """One earnings announcement: a one-day jump in the log price, then calm again.
+
+    days   calendar days from today. The announcement is taken to happen before the
+           open on that day, so on day `days` it has already happened.
+    move   standard deviation of the one-day jump in the log price: 0.08 is about ±8%.
+    """
+
+    days: float
+    move: float
+
+    def __post_init__(self):
+        if not EVENT_DAYS[0] <= self.days <= EVENT_DAYS[1]:
+            raise ValueError(f"earnings must be between {EVENT_DAYS[0]:g} and {EVENT_DAYS[1]:g} days away")
+        if not EVENT_MOVE[0] <= self.move <= EVENT_MOVE[1]:
+            raise ValueError(f"the earnings move must be between {EVENT_MOVE[0]:.1%} and {EVENT_MOVE[1]:.0%}")
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,9 @@ class Position:
                  tree that allows early exercise.
     tree_steps   steps in that tree. The default gives prices accurate to well
                  under a cent per share; the profit grid uses fewer for speed.
+    event        an earnings announcement, or None. Every option that expires after
+                 it has its implied volatility split into an everyday part and the
+                 jump (see `base_vol` and `effective_vol`).
     """
 
     spot: float
@@ -96,6 +120,7 @@ class Position:
     div_yield: float = 0.0
     exercise: str = "european"
     tree_steps: int = 201
+    event: Event | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "legs", tuple(self.legs))
@@ -107,6 +132,8 @@ class Position:
             raise ValueError(f"exercise must be one of {EXERCISE_STYLES}")
         if self.tree_steps < 1:
             raise ValueError("tree_steps must be at least 1")
+        for leg in self.legs:
+            base_vol(leg, self)  # refuses a leg whose volatility cannot contain the earnings move
 
     @property
     def american(self) -> bool:
@@ -121,6 +148,58 @@ def first_expiry(position: Position) -> float | None:
     """Days until the earliest option expiry, or None for a stock-only position."""
     days = [leg.days for leg in position.legs if leg.is_option]
     return min(days) if days else None
+
+
+def event_applies(leg: Leg, position: Position) -> bool:
+    """True for an option that is still alive when the earnings announcement happens."""
+    return leg.is_option and position.event is not None and leg.days > position.event.days
+
+
+def base_vol(leg: Leg, position: Position) -> float:
+    """The everyday volatility left once the earnings jump is taken out of the implied one.
+
+    Variances over the option's life add up:   sigma^2 T = sigma_b^2 T + m^2
+
+    so sigma_b = sqrt((sigma^2 T - m^2) / T). Options that expire before the
+    event, and positions without one, keep their entered volatility.
+    """
+    if not event_applies(leg, position):
+        return leg.vol
+    years = leg.days / bs.DAYS_PER_YEAR
+    move = position.event.move
+    variance = leg.vol**2 * years - move**2
+    if variance <= 0:
+        number = position.legs.index(leg) + 1
+        raise ValueError(
+            f"leg {number}'s {leg.vol:.0%} volatility over {leg.days:g} days cannot contain a ±{move:.0%} earnings move"
+        )
+    return math.sqrt(variance / years)
+
+
+def effective_vol(leg: Leg, position: Position, days_forward=0.0, vol_scale=1.0, vol_shift=0.0):
+    """The volatility to price a leg with, `days_forward` days from today.
+
+    Scaling and shifting act on the everyday volatility only; the earnings move
+    is a fixed input. While the event is still ahead, the jump's variance is
+    spread over the time left:
+
+        sigma_eff = sqrt((sigma_b^2 tau + m^2) / tau)
+
+    Once it has happened, only sigma_b remains: that drop is the IV crush. At
+    days_forward = 0, sigma_eff equals the entered implied volatility.
+    """
+    days_forward, vol_scale, vol_shift = np.broadcast_arrays(
+        np.asarray(days_forward, dtype=float), np.asarray(vol_scale, dtype=float), np.asarray(vol_shift, dtype=float)
+    )
+    if not event_applies(leg, position):
+        return np.maximum(leg.vol * vol_scale + vol_shift, MIN_VOL)
+    everyday = np.maximum(base_vol(leg, position) * vol_scale + vol_shift, MIN_VOL)
+    remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
+    move = position.event.move
+    with np.errstate(divide="ignore", invalid="ignore"):
+        boosted = np.sqrt((everyday**2 * remaining_years + move**2) / remaining_years)
+    ahead = (days_forward < position.event.days) & (remaining_years > 0)
+    return np.where(ahead, boosted, everyday)
 
 
 def leg_price(leg: Leg, position: Position, prices, days_forward=0.0, vol_scale=1.0, vol_shift=0.0):
@@ -140,7 +219,7 @@ def leg_price(leg: Leg, position: Position, prices, days_forward=0.0, vol_scale=
     if not leg.is_option:
         return prices.copy()
     remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
-    vol = np.maximum(leg.vol * vol_scale + vol_shift, MIN_VOL)
+    vol = effective_vol(leg, position, days_forward, vol_scale, vol_shift)
     if position.american:
         return binomial.price_many(
             prices, leg.strike, remaining_years, vol, position.rate, position.div_yield, leg.kind, True, position.tree_steps
@@ -248,9 +327,10 @@ def net_greeks(position: Position, prices=None, days_forward=0.0, vol_scale=1.0)
         if not leg.is_option:
             total["delta"] += leg.size
             continue
-        if position.american:
-            # A tree has no closed-form Greeks, so bump and reprice: the same check
-            # the tests use to verify the Black-Scholes formulas.
+        if position.american or event_applies(leg, position):
+            # A tree has no closed-form Greeks, and with an earnings event the
+            # volatility changes with time, which the closed-form theta ignores.
+            # So bump and reprice: the same check the tests use on the formulas.
             for name, value in _bumped_greeks(leg, position, prices, days_forward, vol_scale).items():
                 total[name] += leg.size * value
             continue
@@ -268,10 +348,18 @@ def _bumped_greeks(leg: Leg, position: Position, prices, days_forward, vol_scale
     def at(s=prices, day=days_forward, shift=0.0):
         return np.asarray(leg_price(leg, position, s, day, vol_scale, shift), dtype=float)
 
-    h = 0.01 * prices  # 1% of the price: wide enough to step over the tree's small kinks
+    # A tree needs 1% of the price to step over its small kinks; a smooth
+    # Black-Scholes price (an earnings leg under European exercise) is far more
+    # accurate with a small step.
+    h = (0.01 if position.american else 1e-4) * prices
     up, mid, down = at(s=prices + h), at(), at(s=prices - h)
     remaining = np.maximum(leg.days - days_forward, 0.0)
     step = np.minimum(0.25, remaining)  # a quarter of a day, never past expiry
+    if event_applies(leg, position):
+        # Never step across the announcement: theta is the decay of an ordinary day,
+        # not the crush. Half the time left keeps the step clear of the event itself.
+        to_event = position.event.days - days_forward
+        step = np.where(to_event > 0, np.minimum(step, to_event / 2), step)
     later = at(day=days_forward + step)
     with np.errstate(divide="ignore", invalid="ignore"):
         theta = np.where(step > 0, (later - mid) / step, 0.0)
