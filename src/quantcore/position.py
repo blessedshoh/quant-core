@@ -171,7 +171,7 @@ def base_vol(leg: Leg, position: Position) -> float:
     if variance <= 0:
         number = position.legs.index(leg) + 1
         raise ValueError(
-            f"leg {number}'s {leg.vol:.0%} volatility over {leg.days:g} days cannot contain a ±{move:.0%} earnings move"
+            f"leg {number}'s {leg.vol:.0%} volatility over {leg.days:g} days cannot contain a ±{move:.0%} earnings move."
         )
     return math.sqrt(variance / years)
 
