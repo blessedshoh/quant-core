@@ -119,7 +119,7 @@ When an event lies strictly inside (0, first expiry), the day axis gains two poi
 
 ## Tests (engine)
 
-- No event: grid, risk, explain and work answers identical to the current ones (byte-for-byte on fixed requests).
+- No event: grid, risk, explain and work answers identical to the current ones in every existing field, on fixed requests. The only additions are new keys set to null (`summary.event`, and the work route's event fields).
 - At t = 0 the event changes no price, cost or Greek.
 - Straddle: value just after the event equals Black-Scholes at σ_b with the remaining time; the drop equals the difference.
 - Effective-volatility Black-Scholes matches a Monte Carlo of diffusion plus a normal log jump on the event day, within simulation error.
