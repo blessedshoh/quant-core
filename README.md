@@ -7,7 +7,7 @@ Option pricing and risk in plain Python: Black-Scholes prices and Greeks, binomi
 | Folder | What it holds |
 |---|---|
 | `src/quantcore/` | The engine (see below). |
-| `tests/` | What "correct" means: 1,906 tests. Run with `pytest`. |
+| `tests/` | What "correct" means: 1,950 tests. Run with `pytest`. |
 | `walkthroughs/` | One notebook per topic: the maths first, then the code, then the checks. |
 | `exercises/` | Blank versions of the core functions, checked against the engine. |
 | `api/` | The FastAPI service that puts the engine behind HTTP. |
