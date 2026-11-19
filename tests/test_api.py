@@ -292,3 +292,74 @@ def test_work_rebuilds_the_grid_headline_numbers():
 def test_work_refuses_a_bad_position():
     response = client.post("/options/work", json={**LONG_CALL, "legs": [{"kind": "call", "quantity": 1}]})
     assert response.status_code == 422
+
+
+# --- earnings events ------------------------------------------------------------
+
+STRADDLE = {
+    "spot": 166.0,
+    "rate": 0.04,
+    "legs": [
+        {"kind": "call", "quantity": 1, "strike": 165, "days": 30, "vol": 0.7},
+        {"kind": "put", "quantity": 1, "strike": 165, "days": 30, "vol": 0.7},
+    ],
+}
+CONDOR = {
+    "spot": 166.0,
+    "rate": 0.04,
+    "legs": [
+        {"kind": "put", "quantity": 1, "strike": 140, "days": 30, "vol": 0.7},
+        {"kind": "put", "quantity": -1, "strike": 150, "days": 30, "vol": 0.66},
+        {"kind": "call", "quantity": -1, "strike": 180, "days": 30, "vol": 0.6},
+        {"kind": "call", "quantity": 1, "strike": 190, "days": 30, "vol": 0.58},
+    ],
+}
+POSITION_ROUTES = ("/options/grid", "/options/risk", "/options/explain", "/options/work")
+
+
+@pytest.mark.parametrize("body", [LONG_CALL, CONDOR])
+@pytest.mark.parametrize("route", POSITION_ROUTES)
+def test_no_event_answers_unchanged(body, route):
+    plain = client.post(route, json=body).json()
+    explicit = client.post(route, json={**body, "event": None}).json()
+    assert plain == explicit
+    if route == "/options/grid":
+        assert plain["summary"]["event"] is None
+
+
+def test_event_on_every_route():
+    body = {**STRADDLE, "event": {"days": 5, "move": 0.08}}
+    for route in POSITION_ROUTES:
+        assert client.post(route, json=body).status_code == 200, route
+    grid = client.post("/options/grid", json=body).json()
+    assert 5 in grid["axes"]["days"]
+    legs = grid["summary"]["event"]["legs"]
+    assert len(legs) == 2 and all(leg["vol_after"] < leg["vol_before"] and leg["weight"] > 0 for leg in legs)
+    work = client.post("/options/work", json=body).json()
+    assert work["event"] == {"days": 5, "move": 0.08}
+    assert work["legs"][0]["base_vol"] == pytest.approx(legs[0]["base_vol"], abs=1e-6)
+
+
+@pytest.mark.parametrize("event", [{"days": 0.5, "move": 0.08}, {"days": 5, "move": 0.6}, {"days": 5, "move": 0.001}])
+def test_event_limits_enforced(event):
+    assert client.post("/options/grid", json={**STRADDLE, "event": event}).status_code == 422
+
+
+def test_too_low_vol_is_a_422_with_the_reason():
+    body = {"spot": 166.0, "legs": [{"kind": "call", "quantity": 1, "strike": 165, "days": 10, "vol": 0.25}], "event": {"days": 5, "move": 0.08}}
+    response = client.post("/options/grid", json=body)
+    assert response.status_code == 422
+    assert "cannot contain" in response.json()["detail"]
+
+
+def test_implied_move_route():
+    import math
+
+    b, m, t1, t2 = 0.35, 0.07, 7 / 365, 35 / 365
+    near, far = math.sqrt(b * b + m * m / t1), math.sqrt(b * b + m * m / t2)
+    body = client.post("/options/implied-move", json={"near_days": 7, "near_vol": near, "far_days": 35, "far_vol": far}).json()
+    assert body["move"] == pytest.approx(m, abs=1e-5)
+    assert body["base_vol"] == pytest.approx(b, abs=1e-5)
+    assert body["expected_abs_move"] == pytest.approx(m * math.sqrt(2 / math.pi), abs=1e-5)
+    swapped = client.post("/options/implied-move", json={"near_days": 35, "near_vol": far, "far_days": 7, "far_vol": near})
+    assert swapped.status_code == 422

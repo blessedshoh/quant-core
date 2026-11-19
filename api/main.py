@@ -22,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import quantcore as qc
-from quantcore import arbitrage, binomial, probability, replicate, scenarios, work
+from quantcore import arbitrage, binomial, earnings, probability, replicate, scenarios, work
 from quantcore import chain as option_chain
 from quantcore.grid import price_axis
 
@@ -61,6 +61,11 @@ class LegIn(BaseModel):
         return self
 
 
+class EventIn(BaseModel):
+    days: float = Field(ge=1, le=1825, description="Calendar days until the earnings announcement.")
+    move: float = Field(ge=0.005, le=0.5, description="One-day standard deviation of the jump in the log price: 0.08 is about ±8%.")
+
+
 class GridRequest(BaseModel):
     spot: float = Field(gt=0, le=1_000_000)
     rate: float = Field(default=0.0, ge=-0.05, le=0.5)
@@ -70,6 +75,7 @@ class GridRequest(BaseModel):
     exercise: Literal["european", "american"] = Field(
         default="european", description="american values every option with a binomial tree that allows early exercise."
     )
+    event: EventIn | None = Field(default=None, description="An earnings announcement. Leave empty for none.")
 
 
 # --- what it gets back --------------------------------------------------------
@@ -99,6 +105,20 @@ class LegOut(BaseModel):
     entry_price: float
 
 
+class EventLegOut(BaseModel):
+    index: int
+    base_vol: float
+    vol_before: float
+    vol_after: float
+    weight: float = Field(description="|size| x vega today: how much the position depends on this leg.")
+
+
+class EventSummary(BaseModel):
+    days: float
+    move: float
+    legs: list[EventLegOut] = Field(description="Legs still alive at the announcement.")
+
+
 class Summary(BaseModel):
     entry_cost: float = Field(description="Positive is a net debit, negative a net credit.")
     first_expiry_days: float | None
@@ -106,6 +126,7 @@ class Summary(BaseModel):
     max_profit: float | None = Field(description="At the first expiry. null means unlimited.")
     max_loss: float | None = Field(description="At the first expiry, as a negative number. null means unlimited.")
     legs: list[LegOut]
+    event: EventSummary | None = None
 
 
 class GridResponse(BaseModel):
@@ -156,6 +177,20 @@ def _position(request: GridRequest) -> qc.Position:
         div_yield=request.div_yield,
         legs=[qc.Leg(**leg.model_dump()) for leg in request.legs],
         exercise=request.exercise,
+        event=None if request.event is None else qc.Event(**request.event.model_dump()),
+    )
+
+
+def _event_summary(position: qc.Position) -> EventSummary | None:
+    if position.event is None:
+        return None
+    return EventSummary(
+        days=position.event.days,
+        move=position.event.move,
+        legs=[
+            EventLegOut(index=i, base_vol=round(b, 6), vol_before=round(before, 6), vol_after=round(after, 6), weight=round(w, 4))
+            for i, b, before, after, w in earnings.event_vols(position)
+        ],
     )
 
 
@@ -204,6 +239,7 @@ def options_grid(request: GridRequest) -> GridResponse:
             max_profit=_finite_or_none(best),
             max_loss=_finite_or_none(worst),
             legs=[LegOut(entry_price=round(qc.entry_price(leg, position), 4)) for leg in position.legs],
+            event=_event_summary(position),
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -327,6 +363,8 @@ class LegWorkOut(BaseModel):
     cost: float
     greeks: dict[str, float] = Field(description="Per share.")
     contribution: dict[str, float] = Field(description="Size times the per-share Greek.")
+    base_vol: float | None = Field(default=None, description="Everyday volatility once the earnings jump is taken out.")
+    vol_after_event: float | None = Field(default=None, description="Volatility left after the announcement.")
 
 
 class IntervalOut(BaseModel):
@@ -354,6 +392,7 @@ class WorkResponse(BaseModel):
     entry_cost: float
     greeks: dict[str, float]
     chance: ChanceWorkOut | None
+    event: EventIn | None = None
 
 
 def _r(x, digits):
@@ -394,6 +433,8 @@ def options_work(request: GridRequest) -> WorkResponse:
             cost=round(leg.cost, 2),
             greeks={k: round(v, 6) for k, v in leg.greeks.items()},
             contribution={k: round(v, 4) for k, v in leg.contribution.items()},
+            base_vol=_r(leg.base_vol, 6),
+            vol_after_event=_r(leg.vol_after_event, 6),
         )
 
     chance = work_out.chance
@@ -416,6 +457,39 @@ def options_work(request: GridRequest) -> WorkResponse:
             ],
             chance=round(chance.chance, 6),
         ),
+        event=None if work_out.event is None else EventIn(days=work_out.event[0], move=work_out.event[1]),
+    )
+
+
+# --- earnings: the move the market is pricing -------------------------------------
+
+
+class ImpliedMoveRequest(BaseModel):
+    near_days: float = Field(gt=0, le=1825, description="Days to the nearer expiry. Both expiries fall after the announcement.")
+    near_vol: float = Field(ge=0.01, le=5.0)
+    far_days: float = Field(gt=0, le=1825)
+    far_vol: float = Field(ge=0.01, le=5.0)
+
+
+class ImpliedMoveResponse(BaseModel):
+    move: float = Field(description="Standard deviation of the one-day jump in the log price.")
+    expected_abs_move: float = Field(description="Average size of the jump, up or down: move x sqrt(2/pi).")
+    base_vol: float = Field(description="Everyday volatility shared by both expiries.")
+    event_variance_share: float = Field(description="Part of the nearer expiry's variance that is the jump.")
+
+
+@app.post("/options/implied-move", response_model=ImpliedMoveResponse)
+def options_implied_move(request: ImpliedMoveRequest) -> ImpliedMoveResponse:
+    """The earnings move and everyday volatility implied by two expiries after the announcement."""
+    try:
+        result = earnings.implied_move(request.near_days, request.near_vol, request.far_days, request.far_vol)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ImpliedMoveResponse(
+        move=round(result.move, 6),
+        expected_abs_move=round(result.expected_abs_move, 6),
+        base_vol=round(result.base_vol, 6),
+        event_variance_share=round(result.event_variance_share, 6),
     )
 
 
