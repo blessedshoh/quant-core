@@ -130,7 +130,7 @@
 **Interfaces:**
 - Consumes: Task 3 JSON shapes.
 - Produces:
-  - `types.ts`: `export interface EarningsEvent { days: number; move: number }`; `Position.event?: EarningsEvent`; `Summary.event: { days: number; move: number; legs: { index: number; base_vol: number; vol_before: number; vol_after: number }[] } | null`; `LegWork.base_vol: number | null`, `LegWork.vol_after_event: number | null`; `WorkResponse.event: EarningsEvent | null`; `ImpliedMoveResponse { move; expected_abs_move; base_vol; event_variance_share }`.
+  - `types.ts`: `export interface EarningsEvent { days: number; move: number }`; `Position.event?: EarningsEvent`; `Summary.event: { days: number; move: number; legs: { index: number; base_vol: number; vol_before: number; vol_after: number; weight: number }[] } | null`; `LegWork.base_vol: number | null`, `LegWork.vol_after_event: number | null`; `WorkResponse.event: EarningsEvent | null`; `ImpliedMoveResponse { move; expected_abs_move; base_vol; event_variance_share }`.
   - `state.ts`: `LIMITS.eventDays = [1, 1825]`, `LIMITS.eventMove = [0.005, 0.5]`; `clonePosition` copies `event` when present; `isValidPosition` checks event limits when present; `encodeState` adds `e: [days, move]` only when an event is set (version stays `v: 1`); `decodeState` reads `e` when present.
   - `api.ts`: `positionBody` sends `event` when present; `fetchImpliedMove(apiBase, request: {near_days; near_vol; far_days; far_vol}, signal?) -> Promise<ImpliedMoveResponse>`.
 - [ ] **Step 1: Write failing tests** in `state.test.mjs`:
