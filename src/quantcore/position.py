@@ -327,14 +327,17 @@ def net_greeks(position: Position, prices=None, days_forward=0.0, vol_scale=1.0)
         if not leg.is_option:
             total["delta"] += leg.size
             continue
-        if position.american or event_applies(leg, position):
-            # A tree has no closed-form Greeks, and with an earnings event the
-            # volatility changes with time, which the closed-form theta ignores.
-            # So bump and reprice: the same check the tests use on the formulas.
+        if position.american:
+            # A tree has no closed-form Greeks, so bump and reprice: the same check
+            # the tests use to verify the Black-Scholes formulas.
             for name, value in _bumped_greeks(leg, position, prices, days_forward, vol_scale).items():
                 total[name] += leg.size * value
             continue
         remaining_years = np.maximum(leg.days - days_forward, 0.0) / bs.DAYS_PER_YEAR
+        if event_applies(leg, position):
+            for name, value in _event_greeks(leg, position, prices, days_forward, vol_scale, remaining_years).items():
+                total[name] += leg.size * value
+            continue
         market = (prices, leg.strike, remaining_years, leg.vol * vol_scale, position.rate, position.div_yield)
         total["delta"] += leg.size * bs.delta(*market, leg.kind)
         total["gamma"] += leg.size * bs.gamma(*market)
@@ -343,15 +346,38 @@ def net_greeks(position: Position, prices=None, days_forward=0.0, vol_scale=1.0)
     return total
 
 
+def _event_greeks(leg: Leg, position: Position, prices, days_forward, vol_scale, remaining_years) -> dict[str, np.ndarray]:
+    """Exact Greeks (per share) of a European leg that is alive at an earnings announcement.
+
+    The price is Black-Scholes at sigma_eff, and sigma_eff does not depend on
+    the stock price, so delta and gamma are the usual formulas at sigma_eff.
+    Two Greeks differ from the plain formulas:
+
+    vega    per point of EVERYDAY volatility, the input the slider and the
+            shocks move: d sigma_eff / d sigma_b = sigma_b / sigma_eff.
+    theta   only everyday variance decays while the jump is still ahead. With
+            total variance w = sigma_b^2 tau + m^2 and dV/dw = S^2 gamma / 2,
+            theta = theta_BS(sigma_eff) + S^2 gamma (sigma_eff^2 - sigma_b^2) / 2.
+    """
+    sigma = effective_vol(leg, position, days_forward, vol_scale)
+    everyday = np.maximum(base_vol(leg, position) * np.asarray(vol_scale, dtype=float), MIN_VOL)
+    market = (prices, leg.strike, remaining_years, sigma, position.rate, position.div_yield)
+    gamma = bs.gamma(*market)
+    theta = bs.theta(*market, leg.kind) + 0.5 * prices**2 * gamma * (sigma**2 - everyday**2)
+    return {
+        "delta": bs.delta(*market, leg.kind),
+        "gamma": gamma,
+        "theta_per_day": theta / bs.DAYS_PER_YEAR,
+        "vega_per_point": bs.vega(*market) * everyday / sigma / 100.0,
+    }
+
+
 def _bumped_greeks(leg: Leg, position: Position, prices, days_forward, vol_scale) -> dict[str, np.ndarray]:
     """Greeks of one leg (per share) by repricing it with each input nudged."""
     def at(s=prices, day=days_forward, shift=0.0):
         return np.asarray(leg_price(leg, position, s, day, vol_scale, shift), dtype=float)
 
-    # A tree needs 1% of the price to step over its small kinks; a smooth
-    # Black-Scholes price (an earnings leg under European exercise) is far more
-    # accurate with a small step.
-    h = (0.01 if position.american else 1e-4) * prices
+    h = 0.01 * prices  # 1% of the price: wide enough to step over the tree's small kinks
     up, mid, down = at(s=prices + h), at(), at(s=prices - h)
     remaining = np.maximum(leg.days - days_forward, 0.0)
     step = np.minimum(0.25, remaining)  # a quarter of a day, never past expiry

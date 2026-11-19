@@ -166,3 +166,37 @@ def test_implied_move_round_trip():
 def test_implied_move_refusals(args):
     with pytest.raises(ValueError):
         implied_move(*args)
+
+
+# --- Greeks of European event legs: exact formulas, no bumping (final review) ---
+
+
+def _per_share(pos, name, day=0.0):
+    return float(net_greeks(pos, days_forward=day)[name]) / 100  # one contract per leg; sum of call and put
+
+
+def test_event_vega_and_theta_follow_the_split():
+    pos = straddle(EVENT)
+    b, s, T, S, K = base_vol(STRADDLE_LEGS[0], pos), 0.70, 30 / 365, 166.0, 165
+    vega = sum(float(bs.vega(S, K, T, s, R, 0.0)) for _ in ("call", "put")) * b / s / 100
+    gamma = float(bs.gamma(S, K, T, s, R, 0.0))
+    # Only everyday variance decays while the jump is still ahead: dV/d(total variance) = S^2 gamma / 2.
+    theta = sum(float(bs.theta(S, K, T, s, R, 0.0, k)) + 0.5 * S * S * gamma * (s * s - b * b) for k in ("call", "put")) / 365
+    assert _per_share(pos, "vega_per_point") == pytest.approx(vega, rel=1e-9)
+    assert _per_share(pos, "theta_per_day") == pytest.approx(theta, rel=1e-9)
+
+
+def test_event_greeks_at_expiry_have_no_spike():
+    pos = Position(spot=150.0, rate=R, legs=(Leg("call", 1, strike=150, days=30, vol=0.7), Leg("put", 1, strike=150, days=30, vol=0.7)), event=EVENT)
+    g = net_greeks(pos, days_forward=30.0)
+    assert float(g["gamma"]) == 0.0
+    assert float(g["theta_per_day"]) == 0.0
+
+
+def test_event_theta_near_expiry_is_exact():
+    pos = straddle(EVENT)
+    b = base_vol(STRADDLE_LEGS[0], pos)
+    for day in (29.94, 29.998):
+        tau = (30 - day) / 365
+        expected = sum(float(bs.theta(166.0, 165, tau, b, R, 0.0, k)) for k in ("call", "put")) / 365
+        assert _per_share(pos, "theta_per_day", day) == pytest.approx(expected, rel=1e-9)

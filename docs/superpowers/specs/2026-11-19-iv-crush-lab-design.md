@@ -65,11 +65,11 @@ event still ahead (t < e):   σ_eff(t) = sqrt((σ_b² τ + m²) / τ)
 event passed (t ≥ e):        σ_eff(t) = σ_b
 ```
 
-At t = 0, σ_eff = σ, so today's prices, entry cost and Greeks equal the no-event values exactly: the split changes nothing today, only how volatility evolves. Prices use Black-Scholes (or the tree, for American positions) with σ_eff. The event is taken to happen before the open on day e: on day e itself it has already happened.
+At t = 0, σ_eff = σ, so today's prices, entry cost, delta and gamma equal the no-event values exactly. Theta and vega do change, correctly: theta counts only the everyday variance decaying while the jump is still ahead (θ = θ_BS(σ_eff) + ½S²Γ(σ_eff² − σ_b²)), and vega is per point of everyday volatility (× σ_b/σ_eff). (Amended after the final review.) Prices use Black-Scholes (or the tree, for American positions) with σ_eff. The event is taken to happen before the open on day e: on day e itself it has already happened.
 
 **Volatility slider and shocks** apply to σ_b; the event term m is held fixed. A "+10 points" scenario raises everyday volatility, not the earnings move. (Builder: state this in show-your-work and on the limits page.)
 
-**Greeks** of event positions are measured by bump-and-reprice through the same valuation function (the path the engine already uses for American Greeks), because the closed-form theta assumes a constant volatility, which no longer holds.
+**Greeks** of European event legs use exact formulas at σ_eff, with the theta and vega adjustments above; American event legs are measured by bump-and-reprice, the path the engine already uses for American Greeks. (Amended after the final review: bumping European legs produced a gamma spike at expiry and overstated theta near it.)
 
 **Distribution and chance of profit.** If the event falls before the first expiry, the log price at expiry has variance σ_b² T + m² per leg. The representative volatility today is unchanged (it is built from entered volatilities, which equal σ_eff at t = 0), so chance of profit today needs no change. Distribution and chance at a later horizon are out of scope.
 
