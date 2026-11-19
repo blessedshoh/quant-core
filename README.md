@@ -19,6 +19,7 @@ Option pricing and risk in plain Python: Black-Scholes prices and Greeks, binomi
 | `position.py` | Multi-leg positions: cost, value, profit, break-evens, limits, net Greeks |
 | `grid.py` | The price × date × volatility profit grid the front end reads from |
 | `probability.py` | Lognormal price distribution, chance of profit, expected profit |
+| `earnings.py` | Earnings volatility: the move two expiries imply; with `position.Event`, the IV crush |
 | `scenarios.py` | Scenario grid and P/L explain |
 | `work.py` | Every intermediate value behind the headline numbers ("show your work") |
 | `chain.py`, `arbitrage.py` | Model option chain with a smile; no-arbitrage rules and a linear-programming search |
@@ -28,6 +29,9 @@ Option pricing and risk in plain Python: Black-Scholes prices and Greeks, binomi
 |---|---|
 | `01_black_scholes.ipynb`: prices and Greeks of one option | `exercises/black_scholes.py` |
 | `02_positions_and_risk.ipynb`: positions, chance of profit, scenarios, P/L explain | `exercises/risk.py` |
+| `03_earnings_volatility.ipynb`: splitting implied volatility, the crush, the implied move | `exercises/earnings.py` |
+
+Binomial trees and arbitrage will follow as walkthroughs 04 and 05.
 
 ## How it is checked
 
@@ -53,7 +57,7 @@ QuantLib is optional. Without it the cross-check tests are skipped.
 
 ## The API
 
-`api/main.py` puts the engine behind HTTP. `POST /options/grid` returns the profit at every price, date and volatility for a position, plus its Greeks and headline numbers; other routes serve the risk view (`/options/risk`, `/options/explain`), show your work (`/options/work`), binomial trees, the chain, arbitrage checks and replication. It stores nothing. Browsers may call it only from `*.blessedshoh.dev`.
+`api/main.py` puts the engine behind HTTP. `POST /options/grid` returns the profit at every price, date and volatility for a position, plus its Greeks and headline numbers; other routes serve the risk view (`/options/risk`, `/options/explain`), show your work (`/options/work`), the earnings move (`/options/implied-move`; position routes also take an optional `event`), binomial trees, the chain, arbitrage checks and replication. It stores nothing. Browsers may call it only from `*.blessedshoh.dev`.
 
 ```
 pip install -e ".[api]"
