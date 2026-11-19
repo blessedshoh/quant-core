@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field, model_validator
 import quantcore as qc
 from quantcore import arbitrage, binomial, earnings, probability, replicate, scenarios, work
 from quantcore import chain as option_chain
+
+from api.fixed_income import router as fixed_income_router
 from quantcore.grid import price_axis
 
 MAX_LEGS = 8
@@ -217,6 +219,9 @@ def _finite_or_none(x: float) -> float | None:
 
 def _rows(table: np.ndarray, digits: int) -> list[list[float]]:
     return np.round(table, digits).tolist()
+
+
+app.include_router(fixed_income_router)
 
 
 @app.get("/health")
