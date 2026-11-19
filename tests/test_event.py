@@ -115,3 +115,54 @@ def test_theta_near_event_is_finite():
     near = net_greeks(straddle(EVENT), days_forward=5 - 1e-4)["theta_per_day"]
     today_plain = net_greeks(straddle())["theta_per_day"]
     assert abs(float(near)) < 10 * abs(float(today_plain))
+
+
+# --- the grid, the implied-move calculator -------------------------------------
+
+from quantcore.earnings import event_vols, implied_move  # noqa: E402
+from quantcore.grid import EVENT_EPSILON_DAYS, day_axis, profit_grid  # noqa: E402
+
+
+def test_day_axis_has_the_event_step():
+    days = day_axis(straddle(EVENT))
+    assert EVENT_EPSILON_DAYS == 1e-4
+    assert np.any(np.isclose(days, 5 - 1e-4, atol=1e-12, rtol=0)) and np.any(days == 5)
+    assert np.array_equal(day_axis(straddle()), 30 * (1 - (1 - np.linspace(0, 1, 25)) ** 3))
+
+
+def test_event_after_first_expiry_adds_no_days():
+    calendar = Position(
+        spot=166.0, rate=R, legs=[Leg("call", -1, strike=170, days=3, vol=0.6), Leg("call", 1, strike=170, days=30, vol=0.6)], event=EVENT
+    )
+    days = day_axis(calendar)
+    assert len(days) == 25 and days[-1] == 3
+
+
+def test_american_grid_with_event():
+    grid = profit_grid(straddle(EVENT, exercise="american"))
+    assert np.any(grid.days == 5)
+    assert np.all(np.isfinite(grid.profit))
+
+
+def test_event_vols_report_each_leg():
+    rows = event_vols(straddle(EVENT))
+    assert [r[0] for r in rows] == [0, 1]
+    index, base, before, after, weight = rows[0]
+    assert before == 0.70 and after == base == base_vol(STRADDLE_LEGS[0], straddle(EVENT)) and weight > 0
+    assert event_vols(straddle()) == []
+
+
+def test_implied_move_round_trip():
+    b, m, t1, t2 = 0.35, 0.07, 7 / 365, 35 / 365
+    near, far = math.sqrt(b * b + m * m / t1), math.sqrt(b * b + m * m / t2)
+    result = implied_move(7, near, 35, far)
+    assert result.move == pytest.approx(m, abs=1e-10)
+    assert result.base_vol == pytest.approx(b, abs=1e-10)
+    assert result.expected_abs_move == pytest.approx(m * math.sqrt(2 / math.pi), abs=1e-12)
+    assert result.event_variance_share == pytest.approx(m * m / (near * near * t1), abs=1e-10)
+
+
+@pytest.mark.parametrize("args", [(35, 0.4, 7, 0.5), (7, 0.3, 35, 0.5), (7, 0.9, 35, 0.1)])
+def test_implied_move_refusals(args):
+    with pytest.raises(ValueError):
+        implied_move(*args)

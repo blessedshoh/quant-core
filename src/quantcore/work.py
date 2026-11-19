@@ -21,7 +21,7 @@ from scipy.special import ndtr
 
 from . import black_scholes as bs
 from . import probability
-from .position import Position, entry_cost, entry_price, first_expiry, leg_price, net_greeks
+from .position import Position, base_vol, entry_cost, entry_price, event_applies, first_expiry, leg_price, net_greeks
 
 GREEK_NAMES = ("delta", "gamma", "theta_per_day", "vega_per_point")
 
@@ -50,6 +50,8 @@ class LegWork:
     cost: float  # size x entry price
     greeks: dict[str, float]  # per share
     contribution: dict[str, float]  # size x per-share Greek
+    base_vol: float | None = None  # everyday volatility once the earnings jump is taken out; None without one
+    vol_after_event: float | None = None  # the volatility left after the announcement
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class Work:
     entry_cost: float
     greeks: dict[str, float]
     chance: ChanceWork | None
+    event: tuple[float, float] | None = None  # (days, move) of the earnings announcement
 
 
 def _leg_work(position: Position, index: int) -> LegWork:
@@ -99,8 +102,9 @@ def _leg_work(position: Position, index: int) -> LegWork:
     american = float(leg_price(leg, position, position.spot)) if position.american else None
 
     # Per-share Greeks: the leg's share of the position's Greeks, divided back by its size.
-    alone = Position(position.spot, (leg,), position.rate, position.div_yield, position.exercise, position.tree_steps)
+    alone = Position(position.spot, (leg,), position.rate, position.div_yield, position.exercise, position.tree_steps, position.event)
     per_share = {name: float(value) / leg.size for name, value in net_greeks(alone).items()}
+    split = base_vol(leg, position) if event_applies(leg, position) else None
 
     return LegWork(
         kind=leg.kind,
@@ -123,6 +127,8 @@ def _leg_work(position: Position, index: int) -> LegWork:
         cost=cost,
         greeks=per_share,
         contribution={name: leg.size * value for name, value in per_share.items()},
+        base_vol=split,
+        vol_after_event=split,
     )
 
 
@@ -155,6 +161,7 @@ def show_work(position: Position) -> Work:
         entry_cost=entry_cost(position),
         greeks={name: float(value) for name, value in net_greeks(position).items()},
         chance=_chance_work(position),
+        event=None if position.event is None else (position.event.days, position.event.move),
     )
 
 

@@ -26,6 +26,7 @@ from .position import Position, entry_cost, first_expiry, net_greeks, profit, va
 AMERICAN_DAYS = 17
 AMERICAN_VOLS = 4
 AMERICAN_GRID_STEPS = 31
+EVENT_EPSILON_DAYS = 1e-4  # about nine seconds before an earnings announcement
 
 
 def price_axis(position: Position, range_pct: float = 0.25, points: int = 81) -> np.ndarray:
@@ -52,7 +53,13 @@ def day_axis(position: Position, points: int = 25) -> np.ndarray:
     if not last:
         return np.array([0.0])
     u = np.linspace(0.0, 1.0, points)
-    return last * (1.0 - (1.0 - u) ** 3)
+    days = last * (1.0 - (1.0 - u) ** 3)
+    event = position.event
+    if event is not None and 0 < event.days < last:
+        # A moment before the announcement and the moment after, so the crush is a
+        # step on the chart instead of being smoothed out between grid dates.
+        days = np.unique(np.concatenate([days, [event.days - EVENT_EPSILON_DAYS, event.days]]))
+    return days
 
 
 def vol_axis(low: float = 0.25, high: float = 3.0, points_each_side: int = 8) -> np.ndarray:

@@ -81,3 +81,18 @@ def test_stock_only_has_no_chance_section():
     work = show_work(Position(spot=SPOT, legs=[Leg("stock", 100)]))
     assert work.chance is None
     assert work.greeks["delta"] == 100
+
+
+def test_work_shows_the_split():
+    from quantcore import Event
+    from quantcore.position import base_vol
+
+    legs = [Leg("call", 1, strike=165, days=30, vol=0.7), Leg("put", 1, strike=165, days=30, vol=0.7)]
+    with_event = Position(spot=166.0, rate=0.04, legs=legs, event=Event(5, 0.08))
+    work = show_work(with_event)
+    for leg, out in zip(legs, work.legs):
+        assert out.base_vol == pytest.approx(base_vol(leg, with_event))
+        assert out.vol_after_event == out.base_vol
+    assert work.event == (5, 0.08)
+    plain = show_work(Position(spot=166.0, rate=0.04, legs=legs))
+    assert plain.event is None and all(l.base_vol is None and l.vol_after_event is None for l in plain.legs)
