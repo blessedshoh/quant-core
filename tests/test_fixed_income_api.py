@@ -79,3 +79,26 @@ def test_cors_allows_the_bonds_site():
                  "Access-Control-Request-Headers": "content-type"},
     )
     assert response.headers.get("access-control-allow-origin") == "https://bonds.blessedshoh.dev"
+
+
+def test_a_declared_oversized_body_is_refused_before_it_is_read():
+    response = client.post(
+        "/fixed-income/bond", content=b"{}", headers={"content-type": "application/json", "content-length": "5000000"}
+    )
+    assert response.status_code == 413
+
+
+def test_inputs_the_model_cannot_answer_are_422_with_cors_not_500():
+    # A bond a week from maturity at 90: no yield brackets it. Before the fix this escaped as a
+    # server error without CORS headers, which the site could only call "unreachable".
+    payload = {**BOND, "bond": {**BOND["bond"], "maturity": "2026-11-25"}, "mode": "price", "cleanPrice": 90}
+    payload.pop("spreadBp")
+    response = client.post("/fixed-income/bond", json=payload, headers={"origin": "https://bonds.blessedshoh.dev"})
+    assert response.status_code == 422
+    assert response.headers.get("access-control-allow-origin") == "https://bonds.blessedshoh.dev"
+
+
+def test_oversized_work_is_refused_quickly():
+    response = client.post("/fixed-income/convertible", json={**CASES["convertible"], "years": 3000})
+    assert response.status_code == 422
+    assert "years" in response.json()["detail"]
