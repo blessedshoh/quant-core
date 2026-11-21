@@ -10,7 +10,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir ".[api]"
 # The fixed income engine, pinned to a release tag of its public repository.
-ARG BONDLAB_VERSION=v0.2.0
+ARG BONDLAB_VERSION=v0.3.0
 RUN pip install --no-cache-dir "bondlab @ https://github.com/blessedshoh/bondlab/archive/refs/tags/${BONDLAB_VERSION}.tar.gz"
 
 COPY api ./api

@@ -1,6 +1,8 @@
 """The /fixed-income routes: bondlab's lab service behind the existing API."""
 
 import json
+import math
+from datetime import date, timedelta
 
 import pytest
 
@@ -102,3 +104,57 @@ def test_oversized_work_is_refused_quickly():
     response = client.post("/fixed-income/convertible", json={**CASES["convertible"], "years": 3000})
     assert response.status_code == 422
     assert "years" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# curve factors
+# ---------------------------------------------------------------------------
+
+PCA_TENORS = ["3 Mo", "6 Mo", "1 Yr", "2 Yr", "3 Yr", "5 Yr", "7 Yr", "10 Yr", "20 Yr", "30 Yr"]
+PCA_BASE = [4.34, 4.43, 4.62, 4.80, 4.84, 4.89, 4.96, 5.07, 5.44, 5.41]
+
+
+def _pca_payload(rows: int) -> dict:
+    days, day = [], date(2016, 11, 21)
+    while len(days) < rows:
+        if day.weekday() < 5:
+            days.append(day.isoformat())
+        day += timedelta(days=1)
+    # Deterministic, curve-shaped moves, quoted to the two decimals the Treasury publishes.
+    yields = [[round(b + 0.5 * math.sin(i / 40 + j / 3) + 0.2 * math.sin(i * (j + 1) / 7), 2)
+               for j, b in enumerate(PCA_BASE)] for i in range(rows)]
+    return {"history": {"days": days, "tenors": PCA_TENORS, "yields": yields}, "scheme": "MonotoneConvex",
+            "position": {"preset": "UST", "coupon": 4.25, "maturity": "2026-11-15"},
+            "faceAmount": 1_000_000, "hedgeTenors": ["2 Yr", "10 Yr"]}
+
+
+def test_pca_ten_year_payload_fits_the_cap():
+    payload = _pca_payload(2520)
+    payload["position"]["maturity"] = "2035-11-15"
+    body = json.dumps(payload).encode()
+    assert len(body) > 180_000  # a real ten-year window is about this size
+    response = client.post("/fixed-income/pca", content=body, headers={"content-type": "application/json"})
+    assert response.status_code == 200, response.text
+    assert len(response.json()["moves"]["level"]) == 2519
+
+
+def test_pca_bad_input_is_422():
+    payload = {**_pca_payload(260), "hedgeTenors": ["10 Yr"]}
+    response = client.post("/fixed-income/pca", json=payload)
+    assert response.status_code == 422
+    assert "exactly two" in response.json()["detail"]
+
+
+def test_only_pca_gets_the_larger_cap():
+    padded = {**BOND, "padding": "x" * 240_000}
+    assert client.post("/fixed-income/bond", json=padded).status_code == 413
+    huge = {**_pca_payload(260), "padding": "x" * 260_000}
+    assert client.post("/fixed-income/pca", json=huge).status_code == 413
+
+
+def test_pca_route_answers_with_the_engine_values():
+    payload = _pca_payload(260)
+    response = client.post("/fixed-income/pca", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json() == json.loads(json.dumps(dict(handle("pca", payload))))
+    assert "rows" in response.json()["position"]
