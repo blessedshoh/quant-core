@@ -53,9 +53,9 @@ The practical payoff is what the factors mean for the bond in the pricer:
 
 - A number on the page that isn't computed in bondlab. Neither the browser nor the API layer computes; the Worker only reads and caches.
 - Any change to the numbers bondlab produces today. All existing tests stay green.
-- A D1 write of any kind. This stage adds reads only: no new table, no precomputation.
+- New D1 writes beyond the existing usage counter: no new table, no precomputation, no bulk loads. The tab's usage event goes through the existing `/hit` counter (one upsert into `daily_events`, at most once per page load), the same as every other tab.
 - A request that ties up the shared API: every input is bounded in `_LIMITS`.
-- A first view that needs the pricer filled in. The PCA charts show without a bond; exposures appear when one is set.
+- A first view that needs the pricer filled in. The lab always holds a bond (the default UST 4% 2036 until the user changes it), so the tab always shows exposures for the bond in state, labelled "your bond from Price a bond", with a link to change it.
 
 ## Constraints
 
@@ -111,7 +111,7 @@ So a window that touches December 2008 drops 3M, one before October 1993 drops 2
 - **curvature:** the middle tenor's loading is above the average of the two ends (belly up).
 - The page states these conventions.
 
-**4. Factor scores.** Day t's factor-k score is fₜₖ = Xₜ · vₖ in bp. The chart shows each factor's running sum over the window: "how the factors moved".
+**4. How the factors moved.** For the chart, day t's factor-k move is the **raw** change projected on the loadings, fₜₖ = ΔYₜ · vₖ in bp, not the centred Xₜ · vₖ. Centred scores sum to exactly zero over the window, so every path would return to zero and hide the window's real net move (in 2022, a rise of hundreds of bp). The chart shows each factor's running sum. That sum telescopes to (Y_end − Y_start) · vₖ: the window's net curve move expressed in factors, which a test checks.
 
 **5. A bond's par-yield DV01s.** These are gₜ: the price change per 100 face for a +1bp move in the par yield at tenor t, with the others held. Computing them by rebuilding the curve about 20 times costs too much: one bootstrap takes about 0.3 s. So the engine uses the chain rule with existing fast pieces:
 - **Curve:** built from the curve day's yields at the PCA tenors only, so the pillars are the tenors.
@@ -156,7 +156,7 @@ All value objects are frozen slotted dataclasses. Public outputs are tuples, and
   - tenors and observation count;
   - all m eigenvalues (bp²) and explained-variance ratios;
   - all m loadings, sign-fixed for the first three;
-  - daily scores for the first three factors, with their days.
+  - daily moves for the first three factors (raw changes projected on the loadings, step 4), with their days.
   - It refuses fewer observations than a stated minimum: 3·m and at least 60.
 - `par_yield_dv01s(pricer, curve, quotes) -> tuple[ParYieldDV01, ...]`. This is the chain-rule step from step 5. `quotes` describes each pillar's instrument: bill or par bond.
 - `factor_exposures(dv01s, pca) -> tuple[float, ...]`: eₖ for k = 1..3.
@@ -234,7 +234,7 @@ Route `pca`. **Payload:**
     - the first three eigenvalues and their square roots;
     - one exposure worked as the dot product √λ₁ · Σ gₜ v₁ₜ with the actual numbers;
     - the level/slope 2 × 2 system with its numbers.
-  - With no bond in the pricer, the bond and hedge parts show a short line pointing to Price a bond.
+  - The bond and hedge parts always use the lab's current bond and the Hedge tab's face amount (`faceAmount`, default 1,000,000). A Factors share link carries the bond, the face amount, `years` and `hedgeTenors`, so it reopens with the same exposures. `encodeLab` writes the bond for the factors tab as it does for price and hedge.
 - **Pages:**
   - `methodology.astro` gets a "Curve factors (PCA)" section: steps 1 to 8 in prose, sources.
   - `limits.astro` gets: in-sample; the window choice changes the answer; linear (first-order) exposures; the tenor set changes over time; holiday gaps count as one day; par yields from the Treasury's fitted curve, not traded bonds; the comparison judged on the same window it was fitted on.
@@ -252,6 +252,7 @@ Route `pca`. **Payload:**
 - **Independent algorithm:** on a fixture of real Treasury par yields, compare against numpy SVD of the centred change matrix (singular values² / (n−2), right singular vectors up to sign). The engine uses `eigh` on the covariance. The fixture is public domain, from treasury.gov's CSV with provenance noted: 2019 to 2023, the 10 tenors.
 - **Published result:** on the same fixture, level explains more than 75% and the first three more than 95%. This is the qualitative Litterman-Scheinkman finding, so the test cites it as a band, not a point.
 - **Signs:** the conventions hold on the fixture and on the synthetic case with flipped inputs.
+- **Factor paths:** the summed daily factor moves equal (Y_end − Y_start) · vₖ (telescoping identity).
 - **Tenor set:** `common_tenors` on hand-built days with each missing pattern (3M in December 2008, 20Y before 1993-10, the 30Y gap) drops exactly those tenors and names the first missing day.
 - **Chain rule:** par-yield DV01s match a full rebuild from bumped par yields (central difference, 1bp) to within 1e-4 per 100 face for a 2Y, 10Y and 25Y bond. This test is slow; it's marked and kept small.
 - **Identities:**
@@ -262,7 +263,7 @@ Route `pca`. **Payload:**
 **quant-core:** the route returns the documented shape; bounds give 422; oversize gives 413; the hedge-tenor rules hold.
 
 **site:**
-- node tests for share-link validation of the new fields;
+- node tests for share-link validation of the new fields, including a factors link carrying the bond and face amount;
 - `history.json` validation and caching keys, with a fake DB;
 - `svelte-check` for bonds and options;
 - the hub build and its flags test.
@@ -270,7 +271,7 @@ Route `pca`. **Payload:**
 **Browser:** run locally with the `api`, `bonds` and `hub` launch configs. Check:
 - desktop and phone width, both themes;
 - windows that drop 3M (2008), 20Y (1992) and 30Y (2004);
-- no bond, and a bond;
+- the default bond, and a bond changed on Price a bond;
 - a share link round trip.
 
 ## Calls made while writing (check these)
@@ -282,6 +283,12 @@ Route `pca`. **Payload:**
 - The DV01 row uses the hedge bond nearest the position's maturity.
 - The minimum sample is max(60, 3·m) daily changes. A 1-year window, about 250 changes, always passes.
 - If the bondlab release has to wait, the site and API changes still go on their branches; nothing deploys before `v0.3.0` is tagged.
+
+## Settled after the builder read (calls; check them)
+
+- **Factor paths use raw changes, not centred ones,** so they show the window's real net move. The centred scores would all end at zero.
+- **The bond is always present.** The lab never has an empty bond, so the tab shows exposures for whatever bond is in state. Factors share links carry the bond and face amount.
+- **The usage event is allowed.** It reuses the existing `/hit` counter, one upsert per page load at most, like every other tab. The anti-goal is about new tables and bulk writes.
 
 ## Left to the builder
 
